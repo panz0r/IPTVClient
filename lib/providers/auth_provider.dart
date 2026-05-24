@@ -168,6 +168,7 @@ class AuthNotifier extends Notifier<AuthState> {
 
       _repository?.close();
       _repository = repository;
+      repository.setAllowedOutputFormats(attempt.allowedOutputFormats);
       invalidateContentProviders(ref);
       state = AuthState.authenticated(
         repository,

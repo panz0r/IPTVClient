@@ -42,12 +42,15 @@ class LiveScreen extends ConsumerWidget {
             }
 
             try {
-              final url = repository.buildLiveStreamUrl(item);
+              final urls = repository.buildLiveStreamUrlCandidates(item);
               context.push(
                 '/player',
                 extra: PlaybackRequest(
                   title: item.name ?? 'Live channel',
-                  url: url,
+                  url: urls.first,
+                  fallbackUrls: urls.length > 1 ? urls.sublist(1) : const [],
+                  kind: PlaybackKind.live,
+                  streamId: item.streamId,
                 ),
               );
             } catch (error) {

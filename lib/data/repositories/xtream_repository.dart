@@ -8,6 +8,7 @@ import '../models/auth_attempt_result.dart';
 import '../models/xtream_credentials.dart';
 import '../services/account_status_parser.dart';
 import '../services/iptv_http_client.dart';
+import '../services/live_stream_format_resolver.dart';
 import '../services/server_url_normalizer.dart';
 
 class XtreamRepository {
@@ -16,6 +17,14 @@ class XtreamRepository {
 
   final XtreamClient _client;
   final http.Client _http;
+  List<String>? _allowedOutputFormats;
+
+  /// Output formats reported by the provider at login (`allowed_output_formats`).
+  List<String>? get allowedOutputFormats => _allowedOutputFormats;
+
+  void setAllowedOutputFormats(List<String>? formats) {
+    _allowedOutputFormats = formats;
+  }
 
   static XtreamRepository fromCredentials(XtreamCredentials credentials) {
     final httpClient = IptvHttpClient();
@@ -129,12 +138,19 @@ class XtreamRepository {
         );
       }
 
+      if (authCheck.allowedOutputFormats != null) {
+        log.writeln(
+          'allowed_output_formats: ${authCheck.allowedOutputFormats!.join(', ')}',
+        );
+      }
+
       log.writeln('Result: SUCCESS');
       return AuthAttemptResult(
         success: true,
         summary: authCheck.summary,
         debugLog: log.toString(),
         accountStatus: authCheck.accountStatus,
+        allowedOutputFormats: authCheck.allowedOutputFormats,
       );
     } on Exception catch (error, stackTrace) {
       log.writeln('');
@@ -189,17 +205,28 @@ class XtreamRepository {
   Future<SeriesInfo> getSeriesInfo(SeriesItem series) =>
       _client.seriesInfoData(series);
 
-  String buildLiveStreamUrl(LiveStreamItem item) {
+  List<String> liveOutputFormats() =>
+      LiveStreamFormatResolver.resolve(_allowedOutputFormats);
+
+  /// Ordered candidate URLs for live playback (format fallbacks).
+  List<String> buildLiveStreamUrlCandidates(LiveStreamItem item) {
     final streamId = item.streamId;
     if (streamId == null) {
       throw StateError('Live stream is missing streamId.');
     }
 
     if (item.directSource != null && item.directSource!.isNotEmpty) {
-      return item.directSource!;
+      return [item.directSource!];
     }
 
-    return _client.streamUrl(streamId, const ['m3u8']);
+    return [
+      for (final format in liveOutputFormats())
+        _client.streamUrl(streamId, [format]),
+    ];
+  }
+
+  String buildLiveStreamUrl(LiveStreamItem item) {
+    return buildLiveStreamUrlCandidates(item).first;
   }
 
   String buildVodUrl(VodItem item) {
@@ -374,12 +401,31 @@ class XtreamRepository {
             : 'Signed in as $username'
         : extra ?? 'Authentication successful';
 
+    final allowedFormats = _readAllowedOutputFormats(info);
+    if (allowedFormats != null) {
+      log.writeln('Live formats (resolved): ${LiveStreamFormatResolver.resolve(allowedFormats).join(', ')}');
+    }
+
     log.writeln('Result: SUCCESS');
     return _AuthPayloadCheck(
       success: true,
       summary: summary,
       accountStatus: account,
+      allowedOutputFormats: allowedFormats,
     );
+  }
+
+  static List<String>? _readAllowedOutputFormats(Map<String, dynamic> info) {
+    final raw = info['allowed_output_formats'];
+    if (raw is! List) {
+      return null;
+    }
+
+    final formats = raw
+        .map((value) => value?.toString().trim() ?? '')
+        .where((value) => value.isNotEmpty)
+        .toList();
+    return formats.isEmpty ? null : formats;
   }
 
   static String _humanizeError(Object error) {
@@ -403,9 +449,11 @@ class _AuthPayloadCheck {
     required this.success,
     this.summary,
     this.accountStatus,
+    this.allowedOutputFormats,
   });
 
   final bool success;
   final String? summary;
   final AccountStatus? accountStatus;
+  final List<String>? allowedOutputFormats;
 }
