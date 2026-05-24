@@ -1,0 +1,26 @@
+---
+description: Local dev workflow for the IPTV Windows app
+globs:
+alwaysApply: true
+---
+
+# Dev workflow (Windows)
+
+After **any code change** that the user should try in the running app:
+
+1. **Kill** the running instance:
+   ```powershell
+   Get-Process -Name iptv -ErrorAction SilentlyContinue | Stop-Process -Force
+   ```
+2. **Rebuild** (debug is fine for iteration):
+   ```powershell
+   flutter build windows --debug
+   ```
+3. **Relaunch**:
+   ```powershell
+   Start-Process "w:\hobby\iptv\build\windows\x64\runner\Debug\iptv.exe"
+   ```
+
+Do this automatically when finishing an implementation iteration unless the user says not to. Hot reload is not used for Windows desktop builds in this project.
+
+Flutter SDK path (if not on PATH): `%LOCALAPPDATA%\flutter\bin`
