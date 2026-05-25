@@ -1,3 +1,7 @@
+# webOS deploy tools (downloaded by scripts)
+/tools/node/
+/tools/webos-cli/
+
 # Miscellaneous
 *.class
 *.log

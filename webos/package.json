@@ -1,0 +1,17 @@
+{
+  "name": "iptv-webos",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "fetch-esbuild": "powershell -ExecutionPolicy Bypass -File scripts/fetch-esbuild.ps1",
+    "watch": "node scripts/build.mjs --watch",
+    "package": "powershell -ExecutionPolicy Bypass -File scripts/package-ipk.ps1",
+    "install:tv": "powershell -ExecutionPolicy Bypass -File scripts/install-tv.ps1",
+    "emulator": "powershell -ExecutionPolicy Bypass -File scripts/deploy-emulator.ps1"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "typescript": "^5.7.0"
+  }
+}

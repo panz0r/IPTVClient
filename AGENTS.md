@@ -6,6 +6,8 @@ This document gives future agents enough context to continue work on `w:\hobby\i
 
 **Cross-platform Flutter IPTV client** (Windows desktop PoC first, Android TV later) that connects to **Xtream Codes** providers and plays **Live TV**, **Movies**, and **Series**.
 
+**UI design spec (for agents):** [`docs/UI_DESIGN_SPEC.md`](docs/UI_DESIGN_SPEC.md) — screens, layout patterns, theme, components, player chrome, and interaction rules.
+
 Users enter server URL + username + password. The app talks to `player_api.php`, browses content by category, searches within each tab, and plays streams via `media_kit`.
 
 This is a **generic player** — users supply their own provider credentials. Do not commit credentials or `.env` files.
@@ -24,6 +26,10 @@ This is a **generic player** — users supply their own provider credentials. Do
 - Android TV prep: leanback manifest, `DpadNavigator`, focusable tiles
 - Windows batch scripts: `start.bat`, `start.bat build`, `stop.bat`
 - Tests for account status, URL normalizer, content search, login widget
+
+### webOS TV (LG)
+
+A parallel **webOS TV web app** lives in [`webos/`](webos/) (TypeScript, packaged as `.ipk`). See [`webos/README.md`](webos/README.md) and [`webos/SETUP.md`](webos/SETUP.md) for SDK setup and sideload. Deploy to a registered TV: run [`deploy-webos-tv.bat`](deploy-webos-tv.bat) from the repo root. Flutter Windows/Android builds are unchanged.
 
 ### Not implemented (deferred)
 - EPG / TV guide

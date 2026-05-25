@@ -1,0 +1,19 @@
+{
+  "id": "com.iptv.player",
+  "version": "1.0.0",
+  "vendor": "IPTVClient",
+  "type": "web",
+  "main": "index.html",
+  "title": "Peders fantastiska IPTV spelare",
+  "icon": "icon.png",
+  "largeIcon": "icon.png",
+  "bgImage": "assets/splash.png",
+  "resolution": "1920x1080",
+  "disableBackHistoryAPI": true,
+  "requiredPermissions": [
+    "network.operation",
+    "network.query",
+    "media.operation",
+    "media.read"
+  ]
+}
