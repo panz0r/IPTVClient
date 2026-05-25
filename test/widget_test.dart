@@ -2,9 +2,10 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:iptv/app.dart';
+import 'package:iptv/core/config/app_info.dart';
 import 'package:iptv/data/models/xtream_credentials.dart';
 import 'package:iptv/data/services/credentials_store.dart';
-import 'package:iptv/providers/auth_provider.dart';
+import 'package:iptv/providers/credentials_provider.dart';
 
 class _FakeCredentialsStore extends CredentialsStore {
   @override
@@ -26,7 +27,7 @@ void main() {
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 100));
 
-    expect(find.text('IPTV Player'), findsWidgets);
+    expect(find.text(kAppDisplayName), findsWidgets);
     expect(find.text('Connect'), findsOneWidget);
   });
 }

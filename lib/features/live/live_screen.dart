@@ -4,7 +4,7 @@ import 'package:go_router/go_router.dart';
 
 import '../../core/widgets/category_browse_layout.dart';
 import '../../data/models/playback_request.dart';
-import '../../providers/auth_provider.dart';
+import '../../providers/xtream_repository_provider.dart';
 import '../../providers/content_providers.dart';
 
 class LiveScreen extends ConsumerWidget {

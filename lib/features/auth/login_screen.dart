@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../core/config/app_info.dart';
 import '../../core/widgets/debug_log_panel.dart';
 import '../../providers/auth_provider.dart';
 import '../../providers/login_form_provider.dart';
@@ -89,7 +90,7 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
                             ),
                             const SizedBox(height: 16),
                             Text(
-                              'IPTV Player',
+                              kAppDisplayName,
                               style: Theme.of(context).textTheme.headlineSmall,
                               textAlign: TextAlign.center,
                             ),

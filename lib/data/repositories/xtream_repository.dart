@@ -205,6 +205,8 @@ class XtreamRepository {
   Future<SeriesInfo> getSeriesInfo(SeriesItem series) =>
       _client.seriesInfoData(series);
 
+  Future<VodInfo> getVodInfo(VodItem item) => _client.vodInfoData(item);
+
   List<String> liveOutputFormats() =>
       LiveStreamFormatResolver.resolve(_allowedOutputFormats);
 

@@ -3,9 +3,9 @@ setlocal
 
 taskkill /IM iptv.exe /F >nul 2>&1
 if errorlevel 1 (
-  echo IPTV Player is not running.
+  echo Peders fantastiska IPTV spelare is not running.
   exit /b 0
 )
 
-echo Stopped IPTV Player.
+echo Stopped Peders fantastiska IPTV spelare.
 exit /b 0

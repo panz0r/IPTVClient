@@ -1,4 +1,6 @@
 import 'package:flutter/material.dart';
+
+import '../../core/config/app_info.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../features/live/live_screen.dart';
@@ -28,7 +30,7 @@ class _HomeShellState extends ConsumerState<HomeShell> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('IPTV Player'),
+        title: const Text(kAppDisplayName),
         actions: [
           IconButton(
             tooltip: 'Log out',
@@ -47,14 +49,11 @@ class _HomeShellState extends ConsumerState<HomeShell> {
               actions: const [SizedBox.shrink()],
             ),
           Expanded(
-            child: IndexedStack(
-              index: _selectedIndex,
-              children: const [
-                LiveScreen(),
-                MoviesScreen(),
-                SeriesScreen(),
-              ],
-            ),
+            child: switch (_selectedIndex) {
+              0 => const LiveScreen(),
+              1 => const MoviesScreen(),
+              _ => const SeriesScreen(),
+            },
           ),
         ],
       ),

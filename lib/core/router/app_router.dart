@@ -1,13 +1,14 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
-import 'package:xtream_code_client/xtream_code_client.dart';
+import 'package:xtream_code_client/xtream_code_client.dart' show SeriesItem, VodItem;
 
 import '../../data/models/playback_request.dart';
 import '../../providers/auth_provider.dart';
 import '../../features/auth/login_screen.dart';
 import '../../features/home/home_shell.dart';
 import '../../features/player/player_screen.dart';
+import '../../features/movies/movie_detail_screen.dart';
 import '../../features/series/series_detail_screen.dart';
 
 final routerProvider = Provider<GoRouter>((ref) {
@@ -39,6 +40,18 @@ final routerProvider = Provider<GoRouter>((ref) {
       GoRoute(
         path: '/home',
         builder: (context, state) => const HomeShell(),
+      ),
+      GoRoute(
+        path: '/movie/:id',
+        builder: (context, state) {
+          final movie = state.extra;
+          if (movie is! VodItem) {
+            return const Scaffold(
+              body: Center(child: Text('Movie not found.')),
+            );
+          }
+          return MovieDetailScreen(movie: movie);
+        },
       ),
       GoRoute(
         path: '/series/:id',

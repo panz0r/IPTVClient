@@ -1,21 +1,27 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 
+import '../../core/services/active_playback_registry.dart';
 import '../../core/widgets/debug_log_panel.dart';
+import 'iptv_video_controls.dart';
 import '../../data/models/playback_request.dart';
 import '../../data/services/stream_probe_service.dart';
+import '../../providers/watch_history_provider.dart';
 
-class PlayerScreen extends StatefulWidget {
+class PlayerScreen extends ConsumerStatefulWidget {
   const PlayerScreen({super.key, required this.request});
 
   final PlaybackRequest request;
 
   @override
-  State<PlayerScreen> createState() => _PlayerScreenState();
+  ConsumerState<PlayerScreen> createState() => _PlayerScreenState();
 }
 
-class _PlayerScreenState extends State<PlayerScreen> {
+class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   late final Player _player;
   late final VideoController _controller;
   late final StreamProbeService _probeService;
@@ -27,6 +33,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
   bool _showDebugLog = false;
   int _urlIndex = 0;
   bool _triedAllUrls = false;
+  bool _historyRecorded = false;
+  bool _playbackFinalized = false;
+  Timer? _progressTimer;
+  Duration _lastPosition = Duration.zero;
+  Duration? _lastDuration;
+  int _resumeTargetMs = 0;
 
   @override
   void initState() {
@@ -34,12 +46,20 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _probeService = StreamProbeService();
     _player = Player();
     _controller = VideoController(_player);
+    ActivePlaybackRegistry.register(
+      _player,
+      onEmergencyShutdown: _emergencyShutdown,
+    );
 
     _appendLog('=== Playback debug ===');
     _appendLog('Title: ${widget.request.title}');
     _appendLog('Kind: ${widget.request.kind.name}');
     if (widget.request.streamId != null) {
       _appendLog('Stream id: ${widget.request.streamId}');
+    }
+    _resumeTargetMs = widget.request.resumePositionMs;
+    if (widget.request.shouldResume) {
+      _appendLog('Resume at: $_resumeTargetMs ms');
     }
     _appendLog('Candidate URLs: ${widget.request.allUrls.length}');
     for (var i = 0; i < widget.request.allUrls.length; i++) {
@@ -52,6 +72,18 @@ class _PlayerScreenState extends State<PlayerScreen> {
         return;
       }
       setState(() => _isBuffering = buffering);
+      if (!buffering && !_historyRecorded && !widget.request.isLive) {
+        _historyRecorded = true;
+        unawaited(_saveProgress());
+      }
+    });
+
+    _player.stream.position.listen((position) {
+      _lastPosition = position;
+    });
+
+    _player.stream.duration.listen((duration) {
+      _lastDuration = duration;
     });
 
     _player.stream.error.listen((error) {
@@ -62,6 +94,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _appendLog('media_kit error: $error');
       _tryNextUrl('Player reported an error.');
     });
+
+    if (!widget.request.isLive) {
+      _progressTimer = Timer.periodic(
+        const Duration(seconds: 10),
+        (_) => unawaited(_saveProgress()),
+      );
+    }
 
     if (widget.request.isLive) {
       _showDebugLog = true;
@@ -135,6 +174,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
       if (!mounted) {
         return;
       }
+
+      if (widget.request.shouldResume) {
+        await _applyResumePosition();
+      }
+
       setState(() => _isBuffering = _player.state.buffering);
     } catch (error) {
       _appendLog('open() failed: $error');
@@ -172,6 +216,126 @@ class _PlayerScreenState extends State<PlayerScreen> {
     });
   }
 
+  int _effectivePositionMs() {
+    final reported = _lastPosition.inMilliseconds;
+    if (reported > 0) {
+      return reported;
+    }
+    return _resumeTargetMs;
+  }
+
+  Future<void> _applyResumePosition() async {
+    final target = Duration(milliseconds: _resumeTargetMs);
+    _appendLog('Seeking to resume position...');
+
+    Future<void> seek() async {
+      await _player.seek(target);
+      _lastPosition = target;
+    }
+
+    if (_player.state.duration > Duration.zero) {
+      await seek();
+      return;
+    }
+
+    final completer = Completer<void>();
+    late final StreamSubscription<Duration> durationSub;
+    durationSub = _player.stream.duration.listen((duration) async {
+      if (duration <= Duration.zero || completer.isCompleted) {
+        return;
+      }
+      await seek();
+      await durationSub.cancel();
+      if (!completer.isCompleted) {
+        completer.complete();
+      }
+    });
+
+    try {
+      await completer.future.timeout(const Duration(seconds: 20));
+      _appendLog('Resume seek applied at ${_lastPosition.inMilliseconds} ms');
+    } catch (_) {
+      await durationSub.cancel();
+      await seek();
+      _appendLog(
+        'Resume seek applied after timeout at ${_lastPosition.inMilliseconds} ms',
+      );
+    }
+
+    // Some streams report duration late; retry if still near start.
+    for (var i = 0; i < 8; i++) {
+      if (!mounted) {
+        return;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+      if (_lastPosition.inMilliseconds >= _resumeTargetMs - 3000) {
+        return;
+      }
+      if (_player.state.duration > Duration.zero) {
+        await seek();
+      }
+    }
+  }
+
+  Future<void> _saveProgress() async {
+    if (widget.request.isLive || widget.request.contentKey == null) {
+      return;
+    }
+
+    await ref.read(watchHistoryProvider.notifier).recordPlayback(
+          request: widget.request,
+          positionMs: _effectivePositionMs(),
+          durationMs: _lastDuration?.inMilliseconds,
+        );
+  }
+
+  Future<void> _emergencyShutdown() async {
+    if (!mounted) {
+      _playbackFinalized = true;
+      _progressTimer?.cancel();
+      try {
+        await _player.pause();
+        await _player.stop();
+      } catch (_) {}
+      return;
+    }
+    await _finalizePlayback();
+  }
+
+  Future<void> _finalizePlayback() async {
+    if (_playbackFinalized) {
+      return;
+    }
+    _playbackFinalized = true;
+    _progressTimer?.cancel();
+    final positionMs = _effectivePositionMs();
+    final durationMs = _lastDuration?.inMilliseconds;
+    if (!widget.request.isLive && widget.request.contentKey != null) {
+      try {
+        await ref.read(watchHistoryProvider.notifier).recordPlayback(
+              request: widget.request,
+              positionMs: positionMs,
+              durationMs: durationMs,
+            );
+      } catch (_) {
+        // Widget may be unmounting; registry will still stop the player.
+      }
+    }
+    try {
+      await _player.pause();
+      await _player.stop();
+    } catch (_) {
+      // Player may already be stopped.
+    }
+  }
+
+  Future<void> _exitPlayer() async {
+    await _finalizePlayback();
+    if (mounted) {
+      Navigator.of(context).pop();
+    }
+  }
+
   void _appendLog(String line) {
     _debugLog.writeln(line);
     if (mounted && _showDebugLog) {
@@ -181,8 +345,19 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   @override
   void dispose() {
+    _playbackFinalized = true;
+    _progressTimer?.cancel();
     _probeService.close();
-    _player.dispose();
+    ActivePlaybackRegistry.unregister(_player);
+    if (!ActivePlaybackRegistry.handledByRegistry) {
+      try {
+        _player.pause();
+        _player.stop();
+      } catch (_) {}
+      try {
+        _player.dispose();
+      } catch (_) {}
+    }
     super.dispose();
   }
 
@@ -190,128 +365,131 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Widget build(BuildContext context) {
     final logText = _debugLog.toString();
 
-    return Scaffold(
-      backgroundColor: Colors.black,
-      body: Column(
-        children: [
-          Expanded(
-            child: Stack(
-              fit: StackFit.expand,
-              children: [
-                Video(
-                  controller: _controller,
-                  controls: MaterialVideoControls,
-                ),
-                SafeArea(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        children: [
-                          IconButton(
-                            onPressed: () => Navigator.of(context).maybePop(),
-                            icon: const Icon(Icons.arrow_back,
-                                color: Colors.white),
-                          ),
-                          if (widget.request.isLive)
-                            TextButton.icon(
-                              onPressed: () {
-                                setState(
-                                  () => _showDebugLog = !_showDebugLog,
-                                );
-                              },
-                              icon: Icon(
-                                _showDebugLog
-                                    ? Icons.bug_report
-                                    : Icons.bug_report_outlined,
-                                color: Colors.white70,
-                                size: 18,
-                              ),
-                              label: Text(
-                                _showDebugLog ? 'Hide log' : 'Debug log',
-                                style: const TextStyle(color: Colors.white70),
-                              ),
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) async {
+        if (didPop) {
+          return;
+        }
+        await _exitPlayer();
+      },
+      child: Scaffold(
+        backgroundColor: Colors.black,
+        body: Column(
+          children: [
+            Expanded(
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  Video(
+                    controller: _controller,
+                    controls: iptvVideoControlsBuilder(
+                      title: widget.request.title,
+                      showSeekBar: !widget.request.isLive,
+                    ),
+                  ),
+                  SafeArea(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            IconButton(
+                              onPressed: _exitPlayer,
+                              icon: const Icon(Icons.arrow_back,
+                                  color: Colors.white),
                             ),
-                          const Spacer(),
-                          if (widget.request.allUrls.length > 1)
-                            Padding(
-                              padding: const EdgeInsets.only(right: 12),
-                              child: Text(
-                                'URL ${_urlIndex + 1}/${widget.request.allUrls.length}',
-                                style: const TextStyle(
-                                  color: Colors.white54,
-                                  fontSize: 12,
+                            if (widget.request.isLive)
+                              TextButton.icon(
+                                onPressed: () {
+                                  setState(
+                                    () => _showDebugLog = !_showDebugLog,
+                                  );
+                                },
+                                icon: Icon(
+                                  _showDebugLog
+                                      ? Icons.bug_report
+                                      : Icons.bug_report_outlined,
+                                  color: Colors.white70,
+                                  size: 18,
+                                ),
+                                label: Text(
+                                  _showDebugLog ? 'Hide log' : 'Debug log',
+                                  style:
+                                      const TextStyle(color: Colors.white70),
                                 ),
                               ),
-                            ),
-                        ],
-                      ),
-                      Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 16),
-                        child: Text(
-                          widget.request.title,
-                          style:
-                              Theme.of(context).textTheme.titleLarge?.copyWith(
-                                    color: Colors.white,
+                            const Spacer(),
+                            if (widget.request.allUrls.length > 1)
+                              Padding(
+                                padding: const EdgeInsets.only(right: 12),
+                                child: Text(
+                                  'URL ${_urlIndex + 1}/${widget.request.allUrls.length}',
+                                  style: const TextStyle(
+                                    color: Colors.white54,
+                                    fontSize: 12,
                                   ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                if (_isBuffering && _errorMessage == null)
-                  const ColoredBox(
-                    color: Colors.black54,
-                    child: Center(child: CircularProgressIndicator()),
-                  ),
-                if (_errorMessage != null)
-                  ColoredBox(
-                    color: Colors.black87,
-                    child: Center(
-                      child: Padding(
-                        padding: const EdgeInsets.all(24),
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            const Icon(Icons.error_outline,
-                                color: Colors.white, size: 48),
-                            const SizedBox(height: 16),
-                            Text(
-                              _errorMessage!,
-                              style: const TextStyle(color: Colors.white),
-                              textAlign: TextAlign.center,
-                            ),
-                            const SizedBox(height: 16),
-                            FilledButton(
-                              onPressed: () {
-                                setState(() => _showDebugLog = true);
-                              },
-                              child: const Text('Show debug log'),
-                            ),
-                            const SizedBox(height: 8),
-                            FilledButton.tonal(
-                              onPressed: () => Navigator.of(context).maybePop(),
-                              child: const Text('Go back'),
-                            ),
+                                ),
+                              ),
                           ],
+                        ),
+                      ],
+                    ),
+                  ),
+                  if (_isBuffering && _errorMessage == null)
+                    const ColoredBox(
+                      color: Colors.black54,
+                      child: Center(child: CircularProgressIndicator()),
+                    ),
+                  if (_errorMessage != null)
+                    ColoredBox(
+                      color: Colors.black87,
+                      child: Center(
+                        child: Padding(
+                          padding: const EdgeInsets.all(24),
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Icon(Icons.error_outline,
+                                  color: Colors.white, size: 48),
+                              const SizedBox(height: 16),
+                              Text(
+                                _errorMessage!,
+                                style: const TextStyle(color: Colors.white),
+                                textAlign: TextAlign.center,
+                              ),
+                              const SizedBox(height: 16),
+                              FilledButton(
+                                onPressed: () {
+                                  setState(() => _showDebugLog = true);
+                                },
+                                child: const Text('Show debug log'),
+                              ),
+                              const SizedBox(height: 8),
+                              FilledButton.tonal(
+                                onPressed: _exitPlayer,
+                                child: const Text('Go back'),
+                              ),
+                            ],
+                          ),
                         ),
                       ),
                     ),
-                  ),
-              ],
-            ),
-          ),
-          if (_showDebugLog)
-            SizedBox(
-              height: MediaQuery.sizeOf(context).height * 0.38,
-              child: DebugLogPanel(
-                log: logText,
-                title: widget.request.isLive
-                    ? 'Live TV playback log'
-                    : 'Playback log',
+                ],
               ),
             ),
-        ],
+            if (_showDebugLog)
+              SizedBox(
+                height: MediaQuery.sizeOf(context).height * 0.38,
+                child: DebugLogPanel(
+                  log: logText,
+                  title: widget.request.isLive
+                      ? 'Live TV playback log'
+                      : 'Playback log',
+                ),
+              ),
+          ],
+        ),
       ),
     );
   }

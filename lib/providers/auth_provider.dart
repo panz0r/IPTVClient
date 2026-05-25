@@ -1,9 +1,11 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../core/services/active_playback_registry.dart';
 import '../data/models/account_status.dart';
 import '../data/models/xtream_credentials.dart';
 import '../data/repositories/xtream_repository.dart';
-import '../data/services/credentials_store.dart';
+import '../data/services/connection_auth_retry.dart';
+import 'credentials_provider.dart';
 import '../data/services/server_url_normalizer.dart';
 import 'login_form_provider.dart';
 import 'content_providers.dart';
@@ -58,16 +60,13 @@ class AuthState {
   bool get isAuthenticated => status == AuthStatus.authenticated;
 }
 
-final credentialsStoreProvider = Provider<CredentialsStore>(
-  (ref) => CredentialsStore(),
-);
-
 final authProvider = NotifierProvider<AuthNotifier, AuthState>(
   AuthNotifier.new,
 );
 
 class AuthNotifier extends Notifier<AuthState> {
   XtreamRepository? _repository;
+  bool _releaseInProgress = false;
 
   @override
   AuthState build() {
@@ -119,11 +118,28 @@ class AuthNotifier extends Notifier<AuthState> {
   }
 
   Future<void> logout() async {
-    _repository?.close();
-    _repository = null;
+    await releaseConnections();
     await ref.read(credentialsStoreProvider).clear();
     invalidateContentProviders(ref);
     state = const AuthState.unauthenticated();
+  }
+
+  /// Stops streams and closes HTTP clients without clearing saved credentials.
+  /// Used when the application exits so the provider frees the connection slot.
+  Future<void> releaseConnections() async {
+    if (_releaseInProgress) {
+      return;
+    }
+    _releaseInProgress = true;
+
+    try {
+      // Stop any active stream first — this is what holds the connection slot.
+      await ActivePlaybackRegistry.stopActivePlayback();
+      _repository?.close();
+      _repository = null;
+    } finally {
+      _releaseInProgress = false;
+    }
   }
 
   Future<void> _connect(
@@ -142,7 +158,8 @@ class AuthNotifier extends Notifier<AuthState> {
       );
 
       repository = XtreamRepository.fromCredentials(normalizedCredentials);
-      final attempt = await repository.authenticateWithDebug(
+      final attempt = await authenticateWithConnectionRetry(
+        repository,
         originalServerInput: credentials.serverUrl,
       );
 
@@ -153,9 +170,16 @@ class AuthNotifier extends Notifier<AuthState> {
               username: credentials.username,
               password: credentials.password,
             );
+        var errorMessage = attempt.summary ??
+            'Connection failed. Check your credentials and try again.';
+        if (attempt.accountStatus?.kind ==
+                AccountStatusKind.maxConnectionsReached &&
+            attempt.summary != null) {
+          errorMessage =
+              '$errorMessage If you just closed the app, wait a few seconds and tap Connect again.';
+        }
         state = AuthState.unauthenticated(
-          errorMessage: attempt.summary ??
-              'Connection failed. Check your credentials and try again.',
+          errorMessage: errorMessage,
           debugLog: attempt.debugLog,
           accountStatus: attempt.accountStatus,
         );
@@ -216,6 +240,3 @@ class AuthNotifier extends Notifier<AuthState> {
   }
 }
 
-final xtreamRepositoryProvider = Provider<XtreamRepository?>((ref) {
-  return ref.watch(authProvider).repository;
-});

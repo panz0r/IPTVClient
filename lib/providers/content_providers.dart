@@ -3,7 +3,7 @@ import 'package:xtream_code_client/xtream_code_client.dart';
 
 import '../data/repositories/xtream_repository.dart';
 import '../data/services/content_search.dart';
-import 'auth_provider.dart';
+import 'xtream_repository_provider.dart';
 
 class CategoryContentState<T> {
   const CategoryContentState({

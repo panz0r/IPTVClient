@@ -54,4 +54,17 @@ void main() {
     expect(status.kind, AccountStatusKind.banned);
     expect(status.title, 'Account banned');
   });
+
+  test('max connections reached still allows authentication flow', () {
+    final status = AccountStatusParser.fromUserInfo({
+      'auth': 1,
+      'status': 'Active',
+      'max_connections': '1',
+      'active_cons': '1',
+    });
+
+    expect(status.kind, AccountStatusKind.maxConnectionsReached);
+    expect(status.isUsable, isTrue);
+    expect(status.title, 'Connection limit reached');
+  });
 }

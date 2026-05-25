@@ -22,7 +22,9 @@ class AccountStatus {
   final String? rawStatus;
   final String? serverMessage;
 
-  bool get isUsable => kind == AccountStatusKind.active;
+  bool get isUsable =>
+      kind == AccountStatusKind.active ||
+      kind == AccountStatusKind.maxConnectionsReached;
 
   String? get successSummary {
     if (!isUsable) {
@@ -38,6 +40,9 @@ class AccountStatus {
     }
     if (maxConnections != null) {
       parts.add('Max connections: $maxConnections');
+      if (activeConnections != null) {
+        parts.add('In use: $activeConnections/$maxConnections');
+      }
     }
     return parts.isEmpty ? null : parts.join(' · ');
   }

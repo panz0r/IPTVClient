@@ -13,7 +13,7 @@ if not exist "%EXE%" goto :Build
 goto :Launch
 
 :Build
-echo Building IPTV Player...
+echo Building Peders fantastiska IPTV spelare...
 call flutter pub get
 if errorlevel 1 (
   echo Build failed: flutter pub get
@@ -32,7 +32,7 @@ if not exist "%EXE%" (
   exit /b 1
 )
 
-echo Starting IPTV Player...
+echo Starting Peders fantastiska IPTV spelare...
 start "" "%CD%\%EXE%"
 exit /b 0
 
