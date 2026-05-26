@@ -9,8 +9,18 @@ import {
 } from '../storage/watch-history';
 import { appState, type TabId } from '../state/app-state';
 import { bindActivate } from '../ui/activate';
-import { focusFirst } from '../ui/focus';
-import { bindTvSearchFields } from '../utils/search-field';
+import { captureFocus, focusFirst, restoreFocus } from '../ui/focus';
+import {
+  bindTvSearchFields,
+  captureSearchEditorState,
+  reopenSearchEditor,
+  runWithSearchBlurSuppressed,
+} from '../utils/search-field';
+import {
+  consumePendingHubRowFocusKey,
+  hubRowPosterSlice,
+  scrollPosterIntoView,
+} from '../utils/hub-row-nav';
 import {
   contentTileHtml,
   emptyStateHtml,
@@ -27,15 +37,68 @@ const SEARCH_DEBOUNCE_MS = 300;
 const MAX_GRID_ITEMS = 300;
 
 const debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+let lastHomeAccountSummary: string | null | undefined;
 
 export function renderHome(root: HTMLElement): void {
-  if (appState.screen.name !== 'home') return;
+  if (appState.screen.name !== 'home') {
+    lastHomeAccountSummary = undefined;
+    return;
+  }
+
   const tab = appState.screen.tab;
   const accountSummary = appState.accountStatus
     ? accountSuccessSummary(appState.accountStatus)
     : null;
 
-  root.innerHTML = `
+  const shell = root.querySelector('.home-screen');
+  if (!shell || lastHomeAccountSummary !== accountSummary) {
+    root.innerHTML = buildHomeShellHtml(tab, accountSummary);
+    bindHomeShellEvents(root);
+    lastHomeAccountSummary = accountSummary;
+  } else {
+    updateBottomNavActive(root, tab);
+  }
+
+  const main = root.querySelector('#home-main') as HTMLElement;
+  bindHomeMainDelegation(main);
+
+  const searchEditor = captureSearchEditorState(root);
+  const focusToken = searchEditor ? null : captureFocus(root);
+
+  runWithSearchBlurSuppressed(() => {
+    if (tab === 'live') {
+      renderLiveTab(main);
+    } else if (tab === 'movies') {
+      renderMoviesTab(main);
+    } else {
+      renderSeriesTab(main);
+    }
+  });
+
+  bindTvSearchFields(main);
+  const pendingRowFocus = consumePendingHubRowFocusKey();
+  if (pendingRowFocus) {
+    const el = findByFocusKey(main, pendingRowFocus);
+    if (el) {
+      el.focus();
+      scrollPosterIntoView(el);
+    }
+  } else if (searchEditor) {
+    reopenSearchEditor(main, searchEditor);
+  } else {
+    restoreFocus(root, focusToken);
+  }
+}
+
+function findByFocusKey(container: HTMLElement, focusKey: string): HTMLElement | null {
+  for (const el of container.querySelectorAll<HTMLElement>('[data-focus-key]')) {
+    if (el.dataset.focusKey === focusKey) return el;
+  }
+  return null;
+}
+
+function buildHomeShellHtml(tab: TabId, accountSummary: string | null): string {
+  return `
     <div class="screen home-screen">
       <header class="app-header" data-focus-zone="header">
         <h1 class="app-header__title">${escapeHtml(APP_NAME)}</h1>
@@ -59,7 +122,9 @@ export function renderHome(root: HTMLElement): void {
       </nav>
     </div>
   `;
+}
 
+function bindHomeShellEvents(root: HTMLElement): void {
   bindActivate(root.querySelector('#logout-btn') as HTMLElement, () => {
     appState.logout();
   });
@@ -69,18 +134,222 @@ export function renderHome(root: HTMLElement): void {
       appState.setTab(btn.dataset.tab as TabId);
     });
   }
+}
 
-  const main = root.querySelector('#home-main') as HTMLElement;
-  if (tab === 'live') {
-    renderLiveTab(main);
-  } else if (tab === 'movies') {
-    renderMoviesTab(main);
-  } else {
-    renderSeriesTab(main);
+function updateBottomNavActive(root: HTMLElement, tab: TabId): void {
+  for (const btn of root.querySelectorAll<HTMLButtonElement>('[data-tab]')) {
+    const isActive = btn.dataset.tab === tab;
+    btn.classList.toggle('nav-item--active', isActive);
+    btn.setAttribute('aria-current', isActive ? 'page' : 'false');
+  }
+}
+
+function bindHomeMainDelegation(main: HTMLElement): void {
+  if (main.dataset.delegateBound === '1') return;
+  main.dataset.delegateBound = '1';
+
+  main.addEventListener('click', (event) => {
+    handleHomeMainActivate(event.target, false);
+  });
+
+  main.addEventListener('keydown', (event) => {
+    if (!(event instanceof KeyboardEvent)) return;
+    const code = event.keyCode;
+    if (code !== 13 && code !== 28 && event.key !== 'Enter') return;
+    if (handleHomeMainActivate(event.target, true)) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+  });
+
+  main.addEventListener('input', (event) => {
+    const input = event.target;
+    if (!(input instanceof HTMLInputElement) || !input.classList.contains('search-field__input')) {
+      return;
+    }
+    const key = input.id;
+    if (!key) return;
+    const existing = debounceTimers.get(key);
+    if (existing) clearTimeout(existing);
+    debounceTimers.set(
+      key,
+      setTimeout(() => {
+        debounceTimers.delete(key);
+        if (key === 'live-search') void appState.setLiveSearch(input.value);
+        else if (key === 'vod-search') appState.setVodSearch(input.value);
+        else if (key === 'series-search') appState.setSeriesSearch(input.value);
+      }, SEARCH_DEBOUNCE_MS),
+    );
+  });
+}
+
+function handleHomeMainActivate(target: EventTarget | null, fromKey: boolean): boolean {
+  if (!(target instanceof Element)) return false;
+
+  const retry = target.closest('[id^="retry-"]') as HTMLElement | null;
+  if (retry) {
+    if (retry.id === 'retry-live') void appState.loadLive();
+    else if (retry.id === 'retry-vod') void appState.loadMovies();
+    else if (retry.id === 'retry-series') void appState.loadSeriesList();
+    return true;
   }
 
-  focusFirst(root);
-  bindTvSearchFields(root);
+  const category = target.closest('[data-category-id]') as HTMLElement | null;
+  if (category) {
+    const id = category.dataset.categoryId!;
+    const cat = appState.liveCategories.find((c) => c.categoryId === id);
+    if (cat) void appState.selectLiveCategory(cat);
+    return true;
+  }
+
+  const liveTile = target.closest('[data-stream-id][data-kind="live"]') as HTMLElement | null;
+  if (liveTile) {
+    const streamId = parseInt(liveTile.dataset.streamId ?? '0', 10);
+    const item = appState.filteredLiveItems().find((i) => i.streamId === streamId);
+    const req = item ? livePlaybackRequest(item) : null;
+    if (req) appState.openPlayer(req);
+    return true;
+  }
+
+  const vodTile = target.closest('[data-stream-id][data-kind="vod"]') as HTMLElement | null;
+  if (vodTile) {
+    const streamId = parseInt(vodTile.dataset.streamId ?? '0', 10);
+    const item =
+      appState.filteredVodItems().find((i) => i.streamId === streamId) ??
+      findVodItem(streamId);
+    if (item) {
+      const req = vodPlaybackRequest(item);
+      if (req) appState.openPlayer(req);
+    }
+    return true;
+  }
+
+  const seriesTile = target.closest('[data-series-id]') as HTMLElement | null;
+  if (seriesTile) {
+    const seriesId = parseInt(seriesTile.dataset.seriesId ?? '0', 10);
+    const series =
+      appState.filteredSeriesItems().find((i) => i.seriesId === seriesId) ??
+      findSeriesItem(seriesId);
+    if (series) appState.openSeriesDetail(series);
+    return true;
+  }
+
+  const seeAll = target.closest('[data-see-all]') as HTMLElement | null;
+  if (seeAll) {
+    const rowId = seeAll.dataset.seeAll!;
+    const tab = appState.screen.name === 'home' ? appState.screen.tab : 'movies';
+    if (tab === 'movies' || tab === 'series') appState.openHubBrowse(tab, rowId);
+    return true;
+  }
+
+  const resume = target.closest('[data-resume-key]') as HTMLElement | null;
+  if (resume && appState.accountKey) {
+    const key = resume.dataset.resumeKey!;
+    const entry = loadHistory(appState.accountKey).find((h) => h.contentKey === key);
+    if (entry) appState.openPlayer(entryToPlaybackRequest(entry));
+    return true;
+  }
+
+  return fromKey;
+}
+
+export function bindAppScreenDelegation(appRoot: HTMLElement): void {
+  if (appRoot.dataset.appDelegateBound === '1') return;
+  appRoot.dataset.appDelegateBound = '1';
+
+  appRoot.addEventListener('click', (event) => {
+    handleAppScreenActivate(event.target);
+  });
+
+  appRoot.addEventListener('keydown', (event) => {
+    if (!(event instanceof KeyboardEvent)) return;
+    const code = event.keyCode;
+    if (code !== 13 && code !== 28 && event.key !== 'Enter') return;
+    if (handleAppScreenActivate(event.target)) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+  });
+}
+
+function handleAppScreenActivate(target: EventTarget | null): boolean {
+  if (!(target instanceof Element)) return false;
+
+  const hubBack = target.closest('#hub-back');
+  if (hubBack && appState.screen.name === 'hub-browse') {
+    appState.goHome(appState.screen.tab);
+    return true;
+  }
+
+  const seriesBack = target.closest('#back-series');
+  if (seriesBack) {
+    appState.goHome('series');
+    return true;
+  }
+
+  const retryDetail = target.closest('#retry-series-detail');
+  if (retryDetail && appState.screen.name === 'series-detail') {
+    void appState.loadSeriesDetail(appState.screen.series);
+    return true;
+  }
+
+  if (appState.screen.name === 'hub-browse') {
+    const { tab, rowId } = appState.screen;
+    const row = tab === 'movies' ? appState.vodHubRow(rowId) : appState.seriesHubRow(rowId);
+    if (!row) return false;
+
+    const vodTile = target.closest('[data-stream-id][data-kind="vod"]') as HTMLElement | null;
+    if (vodTile && tab === 'movies') {
+      const streamId = parseInt(vodTile.dataset.streamId ?? '0', 10);
+      const item = row.items.find((i) => (i as VodItem).streamId === streamId) as VodItem | undefined;
+      if (item) {
+        const req = vodPlaybackRequest(item);
+        if (req) appState.openPlayer(req);
+      }
+      return true;
+    }
+
+    const seriesTile = target.closest('[data-series-id]') as HTMLElement | null;
+    if (seriesTile && tab === 'series') {
+      const seriesId = parseInt(seriesTile.dataset.seriesId ?? '0', 10);
+      const series = row.items.find((i) => (i as SeriesItem).seriesId === seriesId) as
+        | SeriesItem
+        | undefined;
+      if (series) appState.openSeriesDetail(series);
+      return true;
+    }
+  }
+
+  if (appState.screen.name === 'series-detail' && appState.seriesDetail) {
+    const episodeBtn = target.closest('[data-episode-id]') as HTMLElement | null;
+    if (episodeBtn && appState.api) {
+      const series = appState.screen.series;
+      const episodeId = parseInt(episodeBtn.dataset.episodeId ?? '0', 10);
+      const season = episodeBtn.dataset.season ?? '';
+      const ep = appState.seriesDetail.episodes[season]?.find((e) => e.id === episodeId);
+      if (ep) {
+        const req: PlaybackRequest = {
+          title: `${series.name} · ${ep.title}`,
+          url: appState.api.buildEpisodeUrl(ep),
+          fallbackUrls: [],
+          kind: 'series',
+          streamId: null,
+          contentKey: seriesEpisodeContentKey(series.seriesId, episodeId),
+          imageUrl: series.cover,
+          resumePositionMs: 0,
+          vodStreamId: null,
+          seriesId: series.seriesId,
+          episodeId,
+          seriesTitle: series.name,
+          subtitleLanguages: ep.subtitles,
+        };
+        appState.openPlayer(req);
+      }
+      return true;
+    }
+  }
+
+  return false;
 }
 
 export function renderHubBrowse(root: HTMLElement): void {
@@ -100,18 +369,17 @@ export function renderHubBrowse(root: HTMLElement): void {
         ${emptyStateHtml('This row is no longer available.')}
       </div>
     `;
-    bindActivate(root.querySelector('#hub-back') as HTMLElement, () => {
-      appState.goHome(tab);
-    });
     focusFirst(root);
     return;
   }
 
+  const visibleItems = row.items.slice(0, MAX_GRID_ITEMS);
   const posters =
     tab === 'movies'
-      ? row.items.map((item) => moviePoster(item as VodItem)).join('')
-      : row.items.map((item) => seriesPoster(item as SeriesItem)).join('');
+      ? visibleItems.map((item) => moviePoster(item as VodItem, `${rowId}:${item.streamId}`)).join('')
+      : visibleItems.map((item) => seriesPoster(item as SeriesItem, `${rowId}:${item.seriesId}`)).join('');
 
+  const focusToken = captureFocus(root);
   root.innerHTML = `
     <div class="screen hub-browse-screen">
       <header class="app-header">
@@ -128,17 +396,7 @@ export function renderHubBrowse(root: HTMLElement): void {
     </div>
   `;
 
-  bindActivate(root.querySelector('#hub-back') as HTMLElement, () => {
-    appState.goHome(tab);
-  });
-
-  if (tab === 'movies') {
-    bindMoviePosters(root, (id) => row!.items.find((i) => (i as VodItem).streamId === id) as VodItem | undefined);
-  } else {
-    bindSeriesPosters(root, (id) => row!.items.find((i) => (i as SeriesItem).seriesId === id) as SeriesItem | undefined);
-  }
-
-  focusFirst(root);
+  restoreFocus(root, focusToken);
 }
 
 export function renderSeriesDetail(root: HTMLElement): void {
@@ -158,9 +416,6 @@ export function renderSeriesDetail(root: HTMLElement): void {
         ${loadingStateHtml('Loading episodes…')}
       </div>
     `;
-    bindActivate(root.querySelector('#back-series') as HTMLElement, () => {
-      appState.goHome('series');
-    });
     focusFirst(root);
     return;
   }
@@ -177,12 +432,6 @@ export function renderSeriesDetail(root: HTMLElement): void {
         ${errorStateHtml(appState.seriesDetailError ?? 'No data', 'retry-series-detail')}
       </div>
     `;
-    bindActivate(root.querySelector('#back-series') as HTMLElement, () => {
-      appState.goHome('series');
-    });
-    bindActivate(root.querySelector('#retry-series-detail') as HTMLElement, () => {
-      void appState.loadSeriesDetail(series);
-    });
     focusFirst(root);
     return;
   }
@@ -203,6 +452,7 @@ export function renderSeriesDetail(root: HTMLElement): void {
     episodesHtml += '</div></section>';
   }
 
+  const focusToken = captureFocus(root);
   root.innerHTML = `
     <div class="screen series-detail-screen">
       <header class="app-header">
@@ -218,35 +468,7 @@ export function renderSeriesDetail(root: HTMLElement): void {
     </div>
   `;
 
-  bindActivate(root.querySelector('#back-series') as HTMLElement, () => {
-    appState.goHome('series');
-  });
-
-  for (const btn of root.querySelectorAll('[data-episode-id]')) {
-    bindActivate(btn as HTMLElement, () => {
-      const episodeId = parseInt((btn as HTMLElement).dataset.episodeId ?? '0', 10);
-      const season = (btn as HTMLElement).dataset.season ?? '';
-      const ep = info.episodes[season]?.find((e) => e.id === episodeId);
-      if (!ep || !appState.api) return;
-      const req: PlaybackRequest = {
-        title: `${title} · ${ep.title}`,
-        url: appState.api.buildEpisodeUrl(ep),
-        fallbackUrls: [],
-        kind: 'series',
-        streamId: null,
-        contentKey: seriesEpisodeContentKey(series.seriesId, episodeId),
-        imageUrl: series.cover,
-        resumePositionMs: 0,
-        vodStreamId: null,
-        seriesId: series.seriesId,
-        episodeId,
-        seriesTitle: title,
-      };
-      appState.openPlayer(req);
-    });
-  }
-
-  focusFirst(root);
+  restoreFocus(root, focusToken);
 }
 
 function renderLiveTab(main: HTMLElement): void {
@@ -256,9 +478,6 @@ function renderLiveTab(main: HTMLElement): void {
   }
   if (appState.liveError) {
     main.innerHTML = errorStateHtml(appState.liveError, 'retry-live');
-    bindActivate(main.querySelector('#retry-live') as HTMLElement, () => {
-      void appState.loadLive();
-    });
     return;
   }
 
@@ -284,7 +503,10 @@ function renderLiveTab(main: HTMLElement): void {
         </ul>
       </aside>
       <section class="content-panel" data-focus-zone="catalog">
-        ${hubSearchField('live-search', 'Search channels…', appState.liveSearchQuery)}
+        <div class="catalog-search-bar" data-focus-zone="hub-search">
+          ${hubSearchField('live-search', 'Search channels…', appState.liveSearchQuery)}
+        </div>
+        <div class="catalog-scroll">
         ${
           appState.liveLoading
             ? loadingStateHtml('Loading channels…')
@@ -303,30 +525,10 @@ function renderLiveTab(main: HTMLElement): void {
                     .join('')}
                 </div>`
         }
+        </div>
       </section>
     </div>
   `;
-
-  const searchInput = main.querySelector<HTMLInputElement>('#live-search');
-  if (searchInput) {
-    bindDebouncedSearch(searchInput, 'live', (query) => {
-      void appState.setLiveSearch(query);
-    });
-  }
-
-  for (const btn of main.querySelectorAll('[data-category-id]')) {
-    bindActivate(btn as HTMLElement, () => {
-      const id = (btn as HTMLElement).dataset.categoryId!;
-      const cat = appState.liveCategories.find((c) => c.categoryId === id);
-      if (cat) void appState.selectLiveCategory(cat);
-    });
-  }
-
-  bindGridPlayback(main, (el) => {
-    const id = parseInt(el.dataset.streamId ?? '0', 10);
-    const item = appState.filteredLiveItems().find((i) => i.streamId === id);
-    return item ? livePlaybackRequest(item) : null;
-  });
 }
 
 function renderMoviesTab(main: HTMLElement): void {
@@ -336,38 +538,24 @@ function renderMoviesTab(main: HTMLElement): void {
   }
   if (appState.vodError) {
     main.innerHTML = errorStateHtml(appState.vodError, 'retry-vod');
-    bindActivate(main.querySelector('#retry-vod') as HTMLElement, () => {
-      void appState.loadMovies();
-    });
     return;
   }
 
   const isSearching = appState.vodSearchQuery.trim().length > 0;
   main.innerHTML = `
-    <div class="hub-scroll" data-focus-zone="hub">
-      ${hubSearchField('vod-search', 'Search movies by title or genre…', appState.vodSearchQuery)}
+    <div class="hub-layout" data-focus-zone="hub">
+      <div class="hub-search-bar" data-focus-zone="hub-search">
+        ${hubSearchField('vod-search', 'Search movies by title or genre…', appState.vodSearchQuery)}
+      </div>
+      <div class="hub-scroll">
       ${
         isSearching
           ? renderMoviesSearchResults()
           : renderMoviesHubBrowse()
       }
+      </div>
     </div>
   `;
-
-  const searchInput = main.querySelector<HTMLInputElement>('#vod-search');
-  if (searchInput) {
-    bindDebouncedSearch(searchInput, 'vod', (query) => {
-      appState.setVodSearch(query);
-    });
-  }
-
-  if (isSearching) {
-    bindMoviePosters(main, (id) => appState.filteredVodItems().find((i) => i.streamId === id));
-  } else {
-    bindRecentlyWatched(main, 'vod');
-    bindSeeAll(main, 'movies');
-    bindMoviePosters(main, (id) => findVodItem(id));
-  }
 }
 
 function renderSeriesTab(main: HTMLElement): void {
@@ -377,38 +565,24 @@ function renderSeriesTab(main: HTMLElement): void {
   }
   if (appState.seriesError) {
     main.innerHTML = errorStateHtml(appState.seriesError, 'retry-series');
-    bindActivate(main.querySelector('#retry-series') as HTMLElement, () => {
-      void appState.loadSeriesList();
-    });
     return;
   }
 
   const isSearching = appState.seriesSearchQuery.trim().length > 0;
   main.innerHTML = `
-    <div class="hub-scroll" data-focus-zone="hub">
-      ${hubSearchField('series-search', 'Search series by title, cast, or genre…', appState.seriesSearchQuery)}
+    <div class="hub-layout" data-focus-zone="hub">
+      <div class="hub-search-bar" data-focus-zone="hub-search">
+        ${hubSearchField('series-search', 'Search series by title, cast, or genre…', appState.seriesSearchQuery)}
+      </div>
+      <div class="hub-scroll">
       ${
         isSearching
           ? renderSeriesSearchResults()
           : renderSeriesHubBrowse()
       }
+      </div>
     </div>
   `;
-
-  const searchInput = main.querySelector<HTMLInputElement>('#series-search');
-  if (searchInput) {
-    bindDebouncedSearch(searchInput, 'series', (query) => {
-      appState.setSeriesSearch(query);
-    });
-  }
-
-  if (isSearching) {
-    bindSeriesPosters(main, (id) => appState.filteredSeriesItems().find((i) => i.seriesId === id));
-  } else {
-    bindRecentlyWatched(main, 'series');
-    bindSeeAll(main, 'series');
-    bindSeriesPosters(main, (id) => findSeriesItem(id));
-  }
 }
 
 function renderMoviesSearchResults(): string {
@@ -417,7 +591,7 @@ function renderMoviesSearchResults(): string {
     return emptyStateHtml('No movies match your search.');
   }
   return `<div class="hub-search-grid">
-    ${items.map((item) => moviePoster(item)).join('')}
+    ${items.map((item) => moviePoster(item, `search:vod:${item.streamId}`)).join('')}
   </div>`;
 }
 
@@ -427,7 +601,7 @@ function renderSeriesSearchResults(): string {
     return emptyStateHtml('No series match your search.');
   }
   return `<div class="hub-search-grid">
-    ${items.map((item) => seriesPoster(item)).join('')}
+    ${items.map((item) => seriesPoster(item, `search:series:${item.seriesId}`)).join('')}
   </div>`;
 }
 
@@ -438,7 +612,9 @@ function renderMoviesHubBrowse(): string {
       hubRowHtml(
         row.title,
         row.id,
-        row.items.map((item) => moviePoster(item)).join(''),
+        hubRowPosterSlice(row.id, row.items)
+          .map((item) => moviePoster(item, `${row.id}:${item.streamId}`))
+          .join(''),
         row.items.length,
       ),
     )
@@ -466,7 +642,9 @@ function renderSeriesHubBrowse(): string {
       hubRowHtml(
         row.title,
         row.id,
-        row.items.map((item) => seriesPoster(item)).join(''),
+        hubRowPosterSlice(row.id, row.items)
+          .map((item) => seriesPoster(item, `${row.id}:${item.seriesId}`))
+          .join(''),
         row.items.length,
       ),
     )
@@ -494,7 +672,9 @@ function recentlyWatchedSection(
         imageUrl: entry.imageUrl,
         placeholderIcon: entry.kind === 'vod' ? '🎬' : '📺',
         progress,
-        attrs: `data-resume-key="${escapeAttr(entry.contentKey)}"`,
+        attrs:
+          `data-focus-key="recent:${escapeAttr(entry.contentKey)}" ` +
+          `data-resume-key="${escapeAttr(entry.contentKey)}"`,
       });
     })
     .join('');
@@ -541,21 +721,27 @@ function bottomNavItem(id: TabId, label: string, icon: string, active: TabId): s
   `;
 }
 
-function moviePoster(item: VodItem): string {
+function moviePoster(item: VodItem, focusKey?: string): string {
+  const key = focusKey ?? `vod:${item.streamId}`;
   return posterCardHtml({
     title: item.name,
     imageUrl: item.streamIcon,
     placeholderIcon: '🎬',
-    attrs: `data-stream-id="${item.streamId}" data-kind="vod"`,
+    attrs:
+      `data-focus-key="${escapeAttr(key)}" ` +
+      `data-stream-id="${item.streamId}" data-kind="vod"`,
   });
 }
 
-function seriesPoster(item: SeriesItem): string {
+function seriesPoster(item: SeriesItem, focusKey?: string): string {
+  const key = focusKey ?? `series:${item.seriesId}`;
   return posterCardHtml({
     title: item.name,
     imageUrl: item.cover,
     placeholderIcon: '📺',
-    attrs: `data-series-id="${item.seriesId}"`,
+    attrs:
+      `data-focus-key="${escapeAttr(key)}" ` +
+      `data-series-id="${item.seriesId}"`,
   });
 }
 
@@ -591,6 +777,7 @@ function livePlaybackRequest(item: LiveStreamItem): PlaybackRequest | null {
     seriesId: null,
     episodeId: null,
     seriesTitle: null,
+    subtitleLanguages: [],
   };
 }
 
@@ -609,85 +796,8 @@ function vodPlaybackRequest(item: VodItem): PlaybackRequest | null {
     seriesId: null,
     episodeId: null,
     seriesTitle: null,
+    subtitleLanguages: [],
   };
-}
-
-function bindDebouncedSearch(
-  input: HTMLInputElement,
-  key: string,
-  onSearch: (query: string) => void | Promise<void>,
-): void {
-  input.addEventListener('input', () => {
-    const existing = debounceTimers.get(key);
-    if (existing) clearTimeout(existing);
-    debounceTimers.set(
-      key,
-      setTimeout(() => {
-        debounceTimers.delete(key);
-        void onSearch(input.value);
-      }, SEARCH_DEBOUNCE_MS),
-    );
-  });
-}
-
-function bindGridPlayback(
-  container: HTMLElement,
-  buildRequest: (el: HTMLElement) => PlaybackRequest | null,
-): void {
-  for (const el of container.querySelectorAll('[data-stream-id][data-kind="live"]')) {
-    bindActivate(el as HTMLElement, () => {
-      const req = buildRequest(el as HTMLElement);
-      if (req) appState.openPlayer(req);
-    });
-  }
-}
-
-function bindMoviePosters(
-  container: HTMLElement,
-  resolveItem: (streamId: number) => VodItem | undefined,
-): void {
-  for (const el of container.querySelectorAll('[data-stream-id][data-kind="vod"]')) {
-    bindActivate(el as HTMLElement, () => {
-      const id = parseInt((el as HTMLElement).dataset.streamId ?? '0', 10);
-      const item = resolveItem(id);
-      if (!item) return;
-      const req = vodPlaybackRequest(item);
-      if (req) appState.openPlayer(req);
-    });
-  }
-}
-
-function bindSeriesPosters(
-  container: HTMLElement,
-  resolveItem: (seriesId: number) => SeriesItem | undefined,
-): void {
-  for (const el of container.querySelectorAll('[data-series-id]')) {
-    bindActivate(el as HTMLElement, () => {
-      const id = parseInt((el as HTMLElement).dataset.seriesId ?? '0', 10);
-      const series = resolveItem(id);
-      if (series) appState.openSeriesDetail(series);
-    });
-  }
-}
-
-function bindSeeAll(container: HTMLElement, tab: 'movies' | 'series'): void {
-  for (const btn of container.querySelectorAll('[data-see-all]')) {
-    bindActivate(btn as HTMLElement, () => {
-      const rowId = (btn as HTMLElement).dataset.seeAll!;
-      appState.openHubBrowse(tab, rowId);
-    });
-  }
-}
-
-function bindRecentlyWatched(container: HTMLElement, kind: 'vod' | 'series'): void {
-  const history = recentlyWatchedEntries(kind);
-  for (const el of container.querySelectorAll('[data-resume-key]')) {
-    bindActivate(el as HTMLElement, () => {
-      const key = (el as HTMLElement).dataset.resumeKey!;
-      const entry = history.find((h) => h.contentKey === key);
-      if (entry) appState.openPlayer(entryToPlaybackRequest(entry));
-    });
-  }
 }
 
 function logoutIconSvg(): string {

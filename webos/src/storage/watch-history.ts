@@ -31,6 +31,7 @@ export interface PlaybackRequest {
   seriesId: number | null;
   episodeId: number | null;
   seriesTitle: string | null;
+  subtitleLanguages: string[];
 }
 
 const MAX_ENTRIES = 30;
@@ -96,5 +97,6 @@ export function entryToPlaybackRequest(entry: WatchHistoryEntry): PlaybackReques
     seriesId: entry.seriesId,
     episodeId: entry.episodeId,
     seriesTitle: entry.seriesTitle,
+    subtitleLanguages: [],
   };
 }

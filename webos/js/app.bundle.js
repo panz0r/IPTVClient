@@ -211,8 +211,8 @@
   }
 
   // src/api/live-stream-format.ts
-  var DEFAULT_FORMATS = ["ts", "m3u8"];
-  var PREFERRED_ORDER = ["ts", "m3u8", "mkv", "mp4", "rtmp"];
+  var DEFAULT_FORMATS = ["m3u8", "ts"];
+  var PREFERRED_ORDER = ["m3u8", "ts", "mp4", "mkv", "rtmp"];
   function resolveLiveFormats(allowedOutputFormats) {
     if (!allowedOutputFormats || allowedOutputFormats.length === 0) {
       return [...DEFAULT_FORMATS];
@@ -235,6 +235,53 @@
       }
     }
     return ordered;
+  }
+
+  // src/utils/subtitle-hints.ts
+  function isUrlLike(value) {
+    return /^https?:\/\//i.test(value) || value.startsWith("/");
+  }
+  function parseSubtitleHints(value) {
+    var _a, _b, _c, _d, _e, _f, _g, _h, _i;
+    if (value == null) return [];
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (!trimmed) return [];
+      if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
+        try {
+          return parseSubtitleHints(JSON.parse(trimmed));
+        } catch {
+        }
+      }
+      if (isUrlLike(trimmed)) {
+        const label = (_a = trimmed.split("/").pop()) != null ? _a : trimmed;
+        return [{ label, url: trimmed }];
+      }
+      return [{ label: trimmed }];
+    }
+    if (Array.isArray(value)) {
+      return value.flatMap((item) => parseSubtitleHints(item));
+    }
+    if (typeof value === "object") {
+      const row = value;
+      const url = (_e = (_d = (_c = (_b = row.url) != null ? _b : row.path) != null ? _c : row.file) != null ? _d : row.src) != null ? _e : row.link;
+      const labelRaw = (_i = (_h = (_g = (_f = row.lang) != null ? _f : row.language) != null ? _g : row.name) != null ? _h : row.title) != null ? _i : row.label;
+      const urlStr = url != null ? String(url).trim() : "";
+      const labelStr = labelRaw != null ? String(labelRaw).trim() : "";
+      if (urlStr) {
+        return [{ label: labelStr || urlStr.split("/").pop() || "Subtitle", url: urlStr }];
+      }
+      if (labelStr) return [{ label: labelStr }];
+    }
+    return [];
+  }
+  function subtitleHintsToLanguages(hints) {
+    const values = [];
+    for (const hint of hints) {
+      if (hint.url) values.push(hint.url);
+      values.push(hint.label);
+    }
+    return values.filter((v, i, arr) => v && arr.indexOf(v) === i);
   }
 
   // src/api/server-url-normalizer.ts
@@ -428,7 +475,8 @@
       const infoRaw = (_a = data.info) != null ? _a : {};
       return {
         genre: strOrNull(infoRaw.genre),
-        plot: strOrNull(infoRaw.plot)
+        plot: strOrNull(infoRaw.plot),
+        subtitles: subtitleHintsToLanguages(parseSubtitleHints(infoRaw.subtitles))
       };
     }
     async getSeriesCategories() {
@@ -562,7 +610,8 @@
       season: String((_c = r.season) != null ? _c : ""),
       episodeNum: strOrNull(r.episode_num),
       containerExtension: strOrNull(r.container_extension),
-      directSource: strOrNull(r.direct_source)
+      directSource: strOrNull(r.direct_source),
+      subtitles: subtitleHintsToLanguages(parseSubtitleHints(r.subtitles))
     };
   }
   function evaluateAuthPayload(body, log) {
@@ -737,7 +786,8 @@
       vodStreamId: entry.vodStreamId,
       seriesId: entry.seriesId,
       episodeId: entry.episodeId,
-      seriesTitle: entry.seriesTitle
+      seriesTitle: entry.seriesTitle,
+      subtitleLanguages: []
     };
   }
 
@@ -794,6 +844,50 @@
       }
     }
     return normalizedKey;
+  }
+
+  // src/utils/hub-row-nav.ts
+  var HUB_ROW_INITIAL_VISIBLE = 12;
+  var HUB_ROW_LOAD_STEP = 8;
+  var pendingHubRowFocusKey = null;
+  function consumePendingHubRowFocusKey() {
+    const key = pendingHubRowFocusKey;
+    pendingHubRowFocusKey = null;
+    return key;
+  }
+  function scrollPosterIntoView(poster) {
+    const row = poster.closest(".horizontal-poster-row");
+    if (!row) return;
+    const rowRect = row.getBoundingClientRect();
+    const elRect = poster.getBoundingClientRect();
+    const margin = 24;
+    if (elRect.right > rowRect.right - margin) {
+      row.scrollLeft += elRect.right - rowRect.right + margin;
+    } else if (elRect.left < rowRect.left + margin) {
+      row.scrollLeft -= rowRect.left - elRect.left + margin;
+    }
+  }
+  function tryExpandHubRowFromPoster(poster) {
+    if (appState.screen.name !== "home") return false;
+    const tab = appState.screen.tab;
+    if (tab !== "movies" && tab !== "series") return false;
+    const section = poster.closest(".hub-row[data-row-id]");
+    if (!section) return false;
+    const rowId = section.dataset.rowId;
+    if (!rowId) return false;
+    const rowEl = poster.closest(".horizontal-poster-row");
+    if (!rowEl) return false;
+    const items = Array.from(rowEl.querySelectorAll(".poster-card"));
+    const idx = items.indexOf(poster);
+    if (idx < 0 || idx !== items.length - 1) return false;
+    const focusKey = appState.expandHubRow(rowId, tab);
+    if (!focusKey) return false;
+    pendingHubRowFocusKey = focusKey;
+    return true;
+  }
+  function hubRowPosterSlice(rowId, items) {
+    const count = appState.getHubRowVisibleCount(rowId);
+    return items.slice(0, count);
   }
 
   // src/utils/keyboard.ts
@@ -913,7 +1007,10 @@
       this.seriesDetail = null;
       this.seriesDetailLoading = false;
       this.seriesDetailError = null;
+      /** Visible poster count per hub genre row (key = row id). */
+      this.hubRowVisibleCount = {};
       this.listeners = /* @__PURE__ */ new Set();
+      this.genreNotifyTimer = null;
     }
     subscribe(listener) {
       this.listeners.add(listener);
@@ -922,6 +1019,29 @@
     notify() {
       for (const l of this.listeners) {
         l();
+      }
+    }
+    shouldRefreshHubUi() {
+      const name = this.screen.name;
+      return name === "home" || name === "hub-browse";
+    }
+    scheduleGenreHubNotify() {
+      if (!this.shouldRefreshHubUi()) return;
+      if (this.genreNotifyTimer) return;
+      this.genreNotifyTimer = setTimeout(() => {
+        this.genreNotifyTimer = null;
+        if (this.shouldRefreshHubUi()) {
+          this.notify();
+        }
+      }, 1500);
+    }
+    flushGenreHubNotify() {
+      if (this.genreNotifyTimer) {
+        clearTimeout(this.genreNotifyTimer);
+        this.genreNotifyTimer = null;
+      }
+      if (this.shouldRefreshHubUi()) {
+        this.notify();
       }
     }
     async tryAutoLogin() {
@@ -960,6 +1080,10 @@
     logout() {
       dismissTvKeyboard();
       this.vodGenreIndexGeneration += 1;
+      if (this.genreNotifyTimer) {
+        clearTimeout(this.genreNotifyTimer);
+        this.genreNotifyTimer = null;
+      }
       clearCredentials();
       this.api = null;
       this.accountKey = null;
@@ -1046,6 +1170,7 @@
       this.vodError = null;
       this.vodHubRows = [];
       this.vodAllMovies = [];
+      this.hubRowVisibleCount = {};
       this.notify();
       try {
         this.vodAllMovies = await this.api.getVodStreams();
@@ -1058,7 +1183,11 @@
         this.vodLoading = false;
         this.notify();
         if (this.accountKey && this.api) {
-          void this.indexVodGenresInBackground(generation);
+          setTimeout(() => {
+            if (generation === this.vodGenreIndexGeneration) {
+              void this.indexVodGenresInBackground(generation);
+            }
+          }, 3e3);
         }
       } catch (e) {
         this.vodError = String(e);
@@ -1069,7 +1198,9 @@
     rebuildVodHubRows() {
       this.vodHubRows = groupByGenre({
         items: this.vodAllMovies,
-        genreFor: (m) => this.genreForMovie(m)
+        genreFor: (m) => this.genreForMovie(m),
+        maxRows: 20,
+        minItemsPerRow: 3
       });
     }
     genreForMovie(movie) {
@@ -1081,7 +1212,9 @@
       const missingCount = this.vodAllMovies.filter((m) => !this.genreForMovie(m)).length;
       if (missingCount === 0) return;
       this.vodLoadingGenres = true;
-      this.notify();
+      if (this.shouldRefreshHubUi()) {
+        this.notify();
+      }
       const api = this.api;
       const accountKey = this.accountKey;
       const movies = this.vodAllMovies;
@@ -1095,13 +1228,13 @@
           if (generation !== this.vodGenreIndexGeneration) return;
           this.vodGenreByStreamId = genres;
           this.rebuildVodHubRows();
-          this.notify();
+          this.scheduleGenreHubNotify();
         }
       });
       if (generation !== this.vodGenreIndexGeneration) return;
       this.vodLoadingGenres = false;
       this.rebuildVodHubRows();
-      this.notify();
+      this.flushGenreHubNotify();
     }
     setVodSearch(query) {
       this.vodSearchQuery = query;
@@ -1126,12 +1259,15 @@
       this.seriesError = null;
       this.seriesHubRows = [];
       this.seriesAllItems = [];
+      this.hubRowVisibleCount = {};
       this.notify();
       try {
         this.seriesAllItems = await this.api.getSeries();
         this.seriesHubRows = groupByGenre({
           items: this.seriesAllItems,
-          genreFor: (s) => s.genre
+          genreFor: (s) => s.genre,
+          maxRows: 20,
+          minItemsPerRow: 3
         });
       } catch (e) {
         this.seriesError = String(e);
@@ -1155,6 +1291,23 @@
     seriesHubRow(rowId) {
       var _a;
       return (_a = this.seriesHubRows.find((r) => r.id === rowId)) != null ? _a : null;
+    }
+    getHubRowVisibleCount(rowId) {
+      var _a;
+      return (_a = this.hubRowVisibleCount[rowId]) != null ? _a : HUB_ROW_INITIAL_VISIBLE;
+    }
+    /** Load more posters in a hub row; returns focus key for the first newly revealed title. */
+    expandHubRow(rowId, tab) {
+      const row = tab === "movies" ? this.vodHubRow(rowId) : this.seriesHubRow(rowId);
+      if (!row) return null;
+      const prevCount = this.getHubRowVisibleCount(rowId);
+      if (prevCount >= row.items.length) return null;
+      const nextCount = Math.min(prevCount + HUB_ROW_LOAD_STEP, row.items.length);
+      this.hubRowVisibleCount[rowId] = nextCount;
+      const nextItem = row.items[prevCount];
+      const focusKey = tab === "movies" ? `${rowId}:${nextItem.streamId}` : `${rowId}:${nextItem.seriesId}`;
+      this.notify();
+      return focusKey;
     }
     openHubBrowse(tab, rowId) {
       this.screen = { name: "hub-browse", tab, rowId };
@@ -1217,6 +1370,7 @@
       this.seriesHubRows = [];
       this.seriesAllItems = [];
       this.seriesDetail = null;
+      this.hubRowVisibleCount = {};
     }
   };
   var appState = new AppState();
@@ -1357,8 +1511,43 @@
   }
 
   // src/utils/search-field.ts
-  function bindTvSearchFields(root2) {
+  var ignoreSearchBlur = false;
+  function runWithSearchBlurSuppressed(run) {
+    ignoreSearchBlur = true;
+    try {
+      run();
+    } finally {
+      ignoreSearchBlur = false;
+    }
+  }
+  function captureSearchEditorState(root2) {
+    var _a;
+    const el = document.activeElement;
+    if (!(el instanceof HTMLInputElement)) return null;
+    if (!el.classList.contains("search-field__input")) return null;
+    if (!root2.contains(el)) return null;
+    const wrap = el.closest(".search-field-wrap");
+    if (!(wrap == null ? void 0 : wrap.classList.contains("search-field-wrap--editing"))) return null;
+    return {
+      inputId: el.id,
+      cursorPos: (_a = el.selectionStart) != null ? _a : el.value.length
+    };
+  }
+  function reopenSearchEditor(root2, snapshot) {
+    const input = root2.querySelector(`#${cssEscape(snapshot.inputId)}`);
+    if (!input) return;
     for (const btn of root2.querySelectorAll(".search-field--tv")) {
+      if (btn.dataset.searchInput !== snapshot.inputId) continue;
+      const wrap = btn.closest(".search-field-wrap");
+      if (!wrap) return;
+      openSearchEditor(wrap, btn, input, snapshot.cursorPos);
+      return;
+    }
+  }
+  function bindTvSearchFields(root2) {
+    for (const btn of root2.querySelectorAll(
+      ".search-field--tv:not([data-tv-search-bound])"
+    )) {
       const inputId = btn.dataset.searchInput;
       if (!inputId) continue;
       const wrap = btn.closest(".search-field-wrap");
@@ -1368,7 +1557,9 @@
         e.preventDefault();
         openSearchEditor(wrap, btn, input);
       });
+      btn.dataset.tvSearchBound = "true";
       input.addEventListener("blur", () => {
+        if (ignoreSearchBlur) return;
         closeSearchEditor(wrap, btn, input);
       });
       input.addEventListener("keydown", (e) => {
@@ -1381,13 +1572,14 @@
       syncSearchButtonLabel(btn, input);
     }
   }
-  function openSearchEditor(wrap, btn, input) {
+  function openSearchEditor(wrap, btn, input, cursorPos) {
     wrap.classList.add("search-field-wrap--editing");
     input.removeAttribute("readonly");
     input.setAttribute("tabindex", "0");
     input.focus();
     try {
-      input.setSelectionRange(input.value.length, input.value.length);
+      const pos = cursorPos != null ? cursorPos : input.value.length;
+      input.setSelectionRange(pos, pos);
     } catch {
     }
   }
@@ -1416,8 +1608,17 @@
   // src/ui/focus.ts
   var FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]):not([tabindex="-1"]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"]), .focusable';
   var ZONE_ORDER = ["header", "banner", "content", "tabs"];
+  var focusCache = null;
+  var focusCacheGeneration = 0;
+  function invalidateFocusCache() {
+    focusCacheGeneration += 1;
+    focusCache = null;
+  }
   function initFocusRoot(root2) {
     const onKeyDown = (event) => {
+      if (root2.querySelector(".player-screen")) {
+        return;
+      }
       const key = event.key;
       if (key === "ArrowUp" || key === "ArrowDown" || key === "ArrowLeft" || key === "ArrowRight") {
         const current = document.activeElement;
@@ -1425,6 +1626,9 @@
         if (next) {
           event.preventDefault();
           next.focus();
+          if (next.classList.contains("poster-card")) {
+            scrollPosterIntoView(next);
+          }
         }
         return;
       }
@@ -1457,6 +1661,20 @@
       return pickDefaultFocus(root2, all);
     }
     const pool = buildPool(all, current, key);
+    if (key === "ArrowLeft" || key === "ArrowRight") {
+      const sibling = pickHorizontalRowSibling(
+        current,
+        key === "ArrowLeft" ? "prev" : "next"
+      );
+      if (sibling) {
+        scrollPosterIntoView(sibling);
+        return sibling;
+      }
+      if (key === "ArrowRight" && tryExpandHubRowFromPoster(current)) {
+        return null;
+      }
+      if (current.closest(".horizontal-poster-row")) return null;
+    }
     const next = pickDirectional(current, pool, key);
     if (!next && (key === "ArrowUp" || key === "ArrowDown")) {
       return pickCrossZone(current, all, key);
@@ -1466,12 +1684,33 @@
     }
     return next;
   }
+  function pickHorizontalRowSibling(current, direction) {
+    var _a;
+    const row = current.closest(".horizontal-poster-row");
+    if (!row) return null;
+    const items = Array.from(
+      row.querySelectorAll('.poster-card.focusable, .focusable[tabindex="0"]')
+    ).filter((el) => el.classList.contains("poster-card"));
+    const idx = items.indexOf(current);
+    if (idx < 0) return null;
+    const nextIdx = direction === "prev" ? idx - 1 : idx + 1;
+    return (_a = items[nextIdx]) != null ? _a : null;
+  }
   function buildPool(all, current, key) {
     const horizontalRow = current.closest(".horizontal-poster-row");
     if (horizontalRow && (key === "ArrowLeft" || key === "ArrowRight")) {
       return all.filter((el) => horizontalRow.contains(el));
     }
     const sub = subZone(current);
+    if (sub === "hub-search") {
+      if (key === "ArrowDown") {
+        return all.filter((el) => {
+          const z = subZone(el);
+          return z === "hub" || z === "catalog";
+        });
+      }
+      return all.filter((el) => subZone(el) === "hub-search");
+    }
     if (sub === "sidebar") {
       if (key === "ArrowRight") {
         return all.filter((el) => subZone(el) === "catalog");
@@ -1536,6 +1775,13 @@
       return nearestByHorizontal(current, tabPool);
     }
     if (key === "ArrowUp" && (sub === "catalog" || sub === "hub" || sub === "sidebar")) {
+      if (sub === "hub" || sub === "catalog") {
+        const searchPool = all.filter((el) => subZone(el) === "hub-search");
+        if (searchPool.length > 0 && subZone(current) !== "hub-search") {
+          const searchTarget = nearestByVertical(current, searchPool, "up");
+          if (searchTarget) return searchTarget;
+        }
+      }
       const bannerPool = all.filter((el) => topZone(el) === "banner");
       if (bannerPool.length > 0) {
         return nearestByHorizontal(current, bannerPool);
@@ -1610,7 +1856,7 @@
       );
       const dy = direction === "down" ? rect.top - currentRect.bottom : currentRect.top - rect.bottom;
       if (dy < -4) continue;
-      const score = (direction === "down" ? dy : dy) * 1e3 + dx;
+      const score = dy * 1e3 + dx;
       if (score < bestScore) {
         bestScore = score;
         best = candidate;
@@ -1632,6 +1878,9 @@
     if (zone === "sidebar" || zone === "catalog" || zone === "hub") {
       return zone;
     }
+    if (el.closest(".hub-search-bar") || el.closest(".catalog-search-bar")) {
+      return "hub-search";
+    }
     if (el.closest(".category-sidebar")) return "sidebar";
     if (el.closest(".content-panel")) return "catalog";
     if (el.closest(".hub-scroll")) return "hub";
@@ -1639,13 +1888,20 @@
     return topZone(el);
   }
   function visibleFocusables(root2) {
-    return Array.from(root2.querySelectorAll(FOCUSABLE)).filter(
+    if (focusCache && focusCache.root === root2 && focusCache.generation === focusCacheGeneration) {
+      return focusCache.list;
+    }
+    const list = Array.from(root2.querySelectorAll(FOCUSABLE)).filter(
       (el) => el.offsetParent !== null
     );
+    focusCache = { root: root2, list, generation: focusCacheGeneration };
+    return list;
   }
   function pickDefaultFocus(root2, all) {
     var _a;
-    const content = root2.querySelector('[data-focus-zone="content"], [data-focus-zone="catalog"], [data-focus-zone="hub"], [data-focus-zone="sidebar"]');
+    const content = root2.querySelector(
+      '[data-focus-zone="content"], [data-focus-zone="catalog"], [data-focus-zone="hub"], [data-focus-zone="sidebar"]'
+    );
     if (content) {
       const inContent = all.find((el) => content.contains(el));
       if (inContent) return inContent;
@@ -1655,6 +1911,60 @@
   function focusFirst(root2) {
     var _a;
     (_a = pickDefaultFocus(root2, visibleFocusables(root2))) == null ? void 0 : _a.focus();
+  }
+  function captureFocus(root2) {
+    const el = document.activeElement;
+    if (!(el instanceof HTMLElement) || !root2.contains(el)) return null;
+    if (el.id) return `id:${el.id}`;
+    const attrs = [
+      "data-focus-key",
+      "data-stream-id",
+      "data-category-id",
+      "data-tab",
+      "data-series-id",
+      "data-see-all",
+      "data-episode-id",
+      "data-resume-key",
+      "data-search-input"
+    ];
+    for (const attr of attrs) {
+      const value = el.getAttribute(attr);
+      if (value) return `${attr}:${value}`;
+    }
+    return null;
+  }
+  function restoreFocus(root2, token) {
+    if (!token) {
+      focusFirst(root2);
+      return;
+    }
+    const colon = token.indexOf(":");
+    if (colon < 0) {
+      focusFirst(root2);
+      return;
+    }
+    const type = token.slice(0, colon);
+    const value = token.slice(colon + 1);
+    let el = null;
+    if (type === "id") {
+      el = root2.querySelector(`#${cssEscape2(value)}`);
+    } else {
+      el = root2.querySelector(`[${type}="${cssEscapeAttr(value)}"]`);
+    }
+    if (el) {
+      el.focus();
+      return;
+    }
+    focusFirst(root2);
+  }
+  function cssEscape2(value) {
+    if (typeof CSS !== "undefined" && "escape" in CSS) {
+      return CSS.escape(value);
+    }
+    return value.replace(/[^a-zA-Z0-9_-]/g, "\\$&");
+  }
+  function cssEscapeAttr(value) {
+    return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
   }
 
   // src/ui/markup.ts
@@ -1719,11 +2029,57 @@
   var SEARCH_DEBOUNCE_MS = 300;
   var MAX_GRID_ITEMS = 300;
   var debounceTimers = /* @__PURE__ */ new Map();
+  var lastHomeAccountSummary;
   function renderHome(root2) {
-    if (appState.screen.name !== "home") return;
+    if (appState.screen.name !== "home") {
+      lastHomeAccountSummary = void 0;
+      return;
+    }
     const tab = appState.screen.tab;
     const accountSummary = appState.accountStatus ? accountSuccessSummary(appState.accountStatus) : null;
-    root2.innerHTML = `
+    const shell = root2.querySelector(".home-screen");
+    if (!shell || lastHomeAccountSummary !== accountSummary) {
+      root2.innerHTML = buildHomeShellHtml(tab, accountSummary);
+      bindHomeShellEvents(root2);
+      lastHomeAccountSummary = accountSummary;
+    } else {
+      updateBottomNavActive(root2, tab);
+    }
+    const main = root2.querySelector("#home-main");
+    bindHomeMainDelegation(main);
+    const searchEditor = captureSearchEditorState(root2);
+    const focusToken = searchEditor ? null : captureFocus(root2);
+    runWithSearchBlurSuppressed(() => {
+      if (tab === "live") {
+        renderLiveTab(main);
+      } else if (tab === "movies") {
+        renderMoviesTab(main);
+      } else {
+        renderSeriesTab(main);
+      }
+    });
+    bindTvSearchFields(main);
+    const pendingRowFocus = consumePendingHubRowFocusKey();
+    if (pendingRowFocus) {
+      const el = findByFocusKey(main, pendingRowFocus);
+      if (el) {
+        el.focus();
+        scrollPosterIntoView(el);
+      }
+    } else if (searchEditor) {
+      reopenSearchEditor(main, searchEditor);
+    } else {
+      restoreFocus(root2, focusToken);
+    }
+  }
+  function findByFocusKey(container, focusKey) {
+    for (const el of container.querySelectorAll("[data-focus-key]")) {
+      if (el.dataset.focusKey === focusKey) return el;
+    }
+    return null;
+  }
+  function buildHomeShellHtml(tab, accountSummary) {
+    return `
     <div class="screen home-screen">
       <header class="app-header" data-focus-zone="header">
         <h1 class="app-header__title">${escapeHtml(APP_NAME2)}</h1>
@@ -1743,6 +2099,8 @@
       </nav>
     </div>
   `;
+  }
+  function bindHomeShellEvents(root2) {
     bindActivate(root2.querySelector("#logout-btn"), () => {
       appState.logout();
     });
@@ -1751,16 +2109,192 @@
         appState.setTab(btn.dataset.tab);
       });
     }
-    const main = root2.querySelector("#home-main");
-    if (tab === "live") {
-      renderLiveTab(main);
-    } else if (tab === "movies") {
-      renderMoviesTab(main);
-    } else {
-      renderSeriesTab(main);
+  }
+  function updateBottomNavActive(root2, tab) {
+    for (const btn of root2.querySelectorAll("[data-tab]")) {
+      const isActive = btn.dataset.tab === tab;
+      btn.classList.toggle("nav-item--active", isActive);
+      btn.setAttribute("aria-current", isActive ? "page" : "false");
     }
-    focusFirst(root2);
-    bindTvSearchFields(root2);
+  }
+  function bindHomeMainDelegation(main) {
+    if (main.dataset.delegateBound === "1") return;
+    main.dataset.delegateBound = "1";
+    main.addEventListener("click", (event) => {
+      handleHomeMainActivate(event.target, false);
+    });
+    main.addEventListener("keydown", (event) => {
+      if (!(event instanceof KeyboardEvent)) return;
+      const code = event.keyCode;
+      if (code !== 13 && code !== 28 && event.key !== "Enter") return;
+      if (handleHomeMainActivate(event.target, true)) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    });
+    main.addEventListener("input", (event) => {
+      const input = event.target;
+      if (!(input instanceof HTMLInputElement) || !input.classList.contains("search-field__input")) {
+        return;
+      }
+      const key = input.id;
+      if (!key) return;
+      const existing = debounceTimers.get(key);
+      if (existing) clearTimeout(existing);
+      debounceTimers.set(
+        key,
+        setTimeout(() => {
+          debounceTimers.delete(key);
+          if (key === "live-search") void appState.setLiveSearch(input.value);
+          else if (key === "vod-search") appState.setVodSearch(input.value);
+          else if (key === "series-search") appState.setSeriesSearch(input.value);
+        }, SEARCH_DEBOUNCE_MS)
+      );
+    });
+  }
+  function handleHomeMainActivate(target, fromKey) {
+    var _a, _b, _c, _d, _e;
+    if (!(target instanceof Element)) return false;
+    const retry = target.closest('[id^="retry-"]');
+    if (retry) {
+      if (retry.id === "retry-live") void appState.loadLive();
+      else if (retry.id === "retry-vod") void appState.loadMovies();
+      else if (retry.id === "retry-series") void appState.loadSeriesList();
+      return true;
+    }
+    const category = target.closest("[data-category-id]");
+    if (category) {
+      const id = category.dataset.categoryId;
+      const cat = appState.liveCategories.find((c) => c.categoryId === id);
+      if (cat) void appState.selectLiveCategory(cat);
+      return true;
+    }
+    const liveTile = target.closest('[data-stream-id][data-kind="live"]');
+    if (liveTile) {
+      const streamId = parseInt((_a = liveTile.dataset.streamId) != null ? _a : "0", 10);
+      const item = appState.filteredLiveItems().find((i) => i.streamId === streamId);
+      const req = item ? livePlaybackRequest(item) : null;
+      if (req) appState.openPlayer(req);
+      return true;
+    }
+    const vodTile = target.closest('[data-stream-id][data-kind="vod"]');
+    if (vodTile) {
+      const streamId = parseInt((_b = vodTile.dataset.streamId) != null ? _b : "0", 10);
+      const item = (_c = appState.filteredVodItems().find((i) => i.streamId === streamId)) != null ? _c : findVodItem(streamId);
+      if (item) {
+        const req = vodPlaybackRequest(item);
+        if (req) appState.openPlayer(req);
+      }
+      return true;
+    }
+    const seriesTile = target.closest("[data-series-id]");
+    if (seriesTile) {
+      const seriesId = parseInt((_d = seriesTile.dataset.seriesId) != null ? _d : "0", 10);
+      const series = (_e = appState.filteredSeriesItems().find((i) => i.seriesId === seriesId)) != null ? _e : findSeriesItem(seriesId);
+      if (series) appState.openSeriesDetail(series);
+      return true;
+    }
+    const seeAll = target.closest("[data-see-all]");
+    if (seeAll) {
+      const rowId = seeAll.dataset.seeAll;
+      const tab = appState.screen.name === "home" ? appState.screen.tab : "movies";
+      if (tab === "movies" || tab === "series") appState.openHubBrowse(tab, rowId);
+      return true;
+    }
+    const resume = target.closest("[data-resume-key]");
+    if (resume && appState.accountKey) {
+      const key = resume.dataset.resumeKey;
+      const entry = loadHistory(appState.accountKey).find((h) => h.contentKey === key);
+      if (entry) appState.openPlayer(entryToPlaybackRequest(entry));
+      return true;
+    }
+    return fromKey;
+  }
+  function bindAppScreenDelegation(appRoot) {
+    if (appRoot.dataset.appDelegateBound === "1") return;
+    appRoot.dataset.appDelegateBound = "1";
+    appRoot.addEventListener("click", (event) => {
+      handleAppScreenActivate(event.target);
+    });
+    appRoot.addEventListener("keydown", (event) => {
+      if (!(event instanceof KeyboardEvent)) return;
+      const code = event.keyCode;
+      if (code !== 13 && code !== 28 && event.key !== "Enter") return;
+      if (handleAppScreenActivate(event.target)) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    });
+  }
+  function handleAppScreenActivate(target) {
+    var _a, _b, _c, _d, _e;
+    if (!(target instanceof Element)) return false;
+    const hubBack = target.closest("#hub-back");
+    if (hubBack && appState.screen.name === "hub-browse") {
+      appState.goHome(appState.screen.tab);
+      return true;
+    }
+    const seriesBack = target.closest("#back-series");
+    if (seriesBack) {
+      appState.goHome("series");
+      return true;
+    }
+    const retryDetail = target.closest("#retry-series-detail");
+    if (retryDetail && appState.screen.name === "series-detail") {
+      void appState.loadSeriesDetail(appState.screen.series);
+      return true;
+    }
+    if (appState.screen.name === "hub-browse") {
+      const { tab, rowId } = appState.screen;
+      const row = tab === "movies" ? appState.vodHubRow(rowId) : appState.seriesHubRow(rowId);
+      if (!row) return false;
+      const vodTile = target.closest('[data-stream-id][data-kind="vod"]');
+      if (vodTile && tab === "movies") {
+        const streamId = parseInt((_a = vodTile.dataset.streamId) != null ? _a : "0", 10);
+        const item = row.items.find((i) => i.streamId === streamId);
+        if (item) {
+          const req = vodPlaybackRequest(item);
+          if (req) appState.openPlayer(req);
+        }
+        return true;
+      }
+      const seriesTile = target.closest("[data-series-id]");
+      if (seriesTile && tab === "series") {
+        const seriesId = parseInt((_b = seriesTile.dataset.seriesId) != null ? _b : "0", 10);
+        const series = row.items.find((i) => i.seriesId === seriesId);
+        if (series) appState.openSeriesDetail(series);
+        return true;
+      }
+    }
+    if (appState.screen.name === "series-detail" && appState.seriesDetail) {
+      const episodeBtn = target.closest("[data-episode-id]");
+      if (episodeBtn && appState.api) {
+        const series = appState.screen.series;
+        const episodeId = parseInt((_c = episodeBtn.dataset.episodeId) != null ? _c : "0", 10);
+        const season = (_d = episodeBtn.dataset.season) != null ? _d : "";
+        const ep = (_e = appState.seriesDetail.episodes[season]) == null ? void 0 : _e.find((e) => e.id === episodeId);
+        if (ep) {
+          const req = {
+            title: `${series.name} \xB7 ${ep.title}`,
+            url: appState.api.buildEpisodeUrl(ep),
+            fallbackUrls: [],
+            kind: "series",
+            streamId: null,
+            contentKey: seriesEpisodeContentKey(series.seriesId, episodeId),
+            imageUrl: series.cover,
+            resumePositionMs: 0,
+            vodStreamId: null,
+            seriesId: series.seriesId,
+            episodeId,
+            seriesTitle: series.name,
+            subtitleLanguages: ep.subtitles
+          };
+          appState.openPlayer(req);
+        }
+        return true;
+      }
+    }
+    return false;
   }
   function renderHubBrowse(root2) {
     if (appState.screen.name !== "hub-browse") return;
@@ -1778,13 +2312,12 @@
         ${emptyStateHtml("This row is no longer available.")}
       </div>
     `;
-      bindActivate(root2.querySelector("#hub-back"), () => {
-        appState.goHome(tab);
-      });
       focusFirst(root2);
       return;
     }
-    const posters = tab === "movies" ? row.items.map((item) => moviePoster(item)).join("") : row.items.map((item) => seriesPoster(item)).join("");
+    const visibleItems = row.items.slice(0, MAX_GRID_ITEMS);
+    const posters = tab === "movies" ? visibleItems.map((item) => moviePoster(item, `${rowId}:${item.streamId}`)).join("") : visibleItems.map((item) => seriesPoster(item, `${rowId}:${item.seriesId}`)).join("");
+    const focusToken = captureFocus(root2);
     root2.innerHTML = `
     <div class="screen hub-browse-screen">
       <header class="app-header">
@@ -1796,15 +2329,7 @@
       ${row.items.length === 0 ? emptyStateHtml("No titles in this row.") : `<div class="hub-browse-grid">${posters}</div>`}
     </div>
   `;
-    bindActivate(root2.querySelector("#hub-back"), () => {
-      appState.goHome(tab);
-    });
-    if (tab === "movies") {
-      bindMoviePosters(root2, (id) => row.items.find((i) => i.streamId === id));
-    } else {
-      bindSeriesPosters(root2, (id) => row.items.find((i) => i.seriesId === id));
-    }
-    focusFirst(root2);
+    restoreFocus(root2, focusToken);
   }
   function renderSeriesDetail(root2) {
     var _a, _b;
@@ -1823,9 +2348,6 @@
         ${loadingStateHtml("Loading episodes\u2026")}
       </div>
     `;
-      bindActivate(root2.querySelector("#back-series"), () => {
-        appState.goHome("series");
-      });
       focusFirst(root2);
       return;
     }
@@ -1841,12 +2363,6 @@
         ${errorStateHtml((_a = appState.seriesDetailError) != null ? _a : "No data", "retry-series-detail")}
       </div>
     `;
-      bindActivate(root2.querySelector("#back-series"), () => {
-        appState.goHome("series");
-      });
-      bindActivate(root2.querySelector("#retry-series-detail"), () => {
-        void appState.loadSeriesDetail(series);
-      });
       focusFirst(root2);
       return;
     }
@@ -1864,6 +2380,7 @@
       }
       episodesHtml += "</div></section>";
     }
+    const focusToken = captureFocus(root2);
     root2.innerHTML = `
     <div class="screen series-detail-screen">
       <header class="app-header">
@@ -1878,34 +2395,7 @@
       </div>
     </div>
   `;
-    bindActivate(root2.querySelector("#back-series"), () => {
-      appState.goHome("series");
-    });
-    for (const btn of root2.querySelectorAll("[data-episode-id]")) {
-      bindActivate(btn, () => {
-        var _a2, _b2, _c;
-        const episodeId = parseInt((_a2 = btn.dataset.episodeId) != null ? _a2 : "0", 10);
-        const season = (_b2 = btn.dataset.season) != null ? _b2 : "";
-        const ep = (_c = info.episodes[season]) == null ? void 0 : _c.find((e) => e.id === episodeId);
-        if (!ep || !appState.api) return;
-        const req = {
-          title: `${title} \xB7 ${ep.title}`,
-          url: appState.api.buildEpisodeUrl(ep),
-          fallbackUrls: [],
-          kind: "series",
-          streamId: null,
-          contentKey: seriesEpisodeContentKey(series.seriesId, episodeId),
-          imageUrl: series.cover,
-          resumePositionMs: 0,
-          vodStreamId: null,
-          seriesId: series.seriesId,
-          episodeId,
-          seriesTitle: title
-        };
-        appState.openPlayer(req);
-      });
-    }
-    focusFirst(root2);
+    restoreFocus(root2, focusToken);
   }
   function renderLiveTab(main) {
     if (appState.liveLoading && appState.liveCategories.length === 0) {
@@ -1914,9 +2404,6 @@
     }
     if (appState.liveError) {
       main.innerHTML = errorStateHtml(appState.liveError, "retry-live");
-      bindActivate(main.querySelector("#retry-live"), () => {
-        void appState.loadLive();
-      });
       return;
     }
     const items = appState.filteredLiveItems();
@@ -1938,7 +2425,10 @@
         </ul>
       </aside>
       <section class="content-panel" data-focus-zone="catalog">
-        ${hubSearchField("live-search", "Search channels\u2026", appState.liveSearchQuery)}
+        <div class="catalog-search-bar" data-focus-zone="hub-search">
+          ${hubSearchField("live-search", "Search channels\u2026", appState.liveSearchQuery)}
+        </div>
+        <div class="catalog-scroll">
         ${appState.liveLoading ? loadingStateHtml("Loading channels\u2026") : items.length === 0 ? emptyStateHtml("No channels in this category.") : `<div class="live-grid" id="live-grid">
                   ${items.slice(0, MAX_GRID_ITEMS).map(
       (item) => contentTileHtml({
@@ -1948,28 +2438,10 @@
       })
     ).join("")}
                 </div>`}
+        </div>
       </section>
     </div>
   `;
-    const searchInput = main.querySelector("#live-search");
-    if (searchInput) {
-      bindDebouncedSearch(searchInput, "live", (query) => {
-        void appState.setLiveSearch(query);
-      });
-    }
-    for (const btn of main.querySelectorAll("[data-category-id]")) {
-      bindActivate(btn, () => {
-        const id = btn.dataset.categoryId;
-        const cat = appState.liveCategories.find((c) => c.categoryId === id);
-        if (cat) void appState.selectLiveCategory(cat);
-      });
-    }
-    bindGridPlayback(main, (el) => {
-      var _a;
-      const id = parseInt((_a = el.dataset.streamId) != null ? _a : "0", 10);
-      const item = appState.filteredLiveItems().find((i) => i.streamId === id);
-      return item ? livePlaybackRequest(item) : null;
-    });
   }
   function renderMoviesTab(main) {
     if (appState.vodLoading && appState.vodHubRows.length === 0) {
@@ -1978,31 +2450,19 @@
     }
     if (appState.vodError) {
       main.innerHTML = errorStateHtml(appState.vodError, "retry-vod");
-      bindActivate(main.querySelector("#retry-vod"), () => {
-        void appState.loadMovies();
-      });
       return;
     }
     const isSearching = appState.vodSearchQuery.trim().length > 0;
     main.innerHTML = `
-    <div class="hub-scroll" data-focus-zone="hub">
-      ${hubSearchField("vod-search", "Search movies by title or genre\u2026", appState.vodSearchQuery)}
+    <div class="hub-layout" data-focus-zone="hub">
+      <div class="hub-search-bar" data-focus-zone="hub-search">
+        ${hubSearchField("vod-search", "Search movies by title or genre\u2026", appState.vodSearchQuery)}
+      </div>
+      <div class="hub-scroll">
       ${isSearching ? renderMoviesSearchResults() : renderMoviesHubBrowse()}
+      </div>
     </div>
   `;
-    const searchInput = main.querySelector("#vod-search");
-    if (searchInput) {
-      bindDebouncedSearch(searchInput, "vod", (query) => {
-        appState.setVodSearch(query);
-      });
-    }
-    if (isSearching) {
-      bindMoviePosters(main, (id) => appState.filteredVodItems().find((i) => i.streamId === id));
-    } else {
-      bindRecentlyWatched(main, "vod");
-      bindSeeAll(main, "movies");
-      bindMoviePosters(main, (id) => findVodItem(id));
-    }
   }
   function renderSeriesTab(main) {
     if (appState.seriesLoading && appState.seriesHubRows.length === 0) {
@@ -2011,31 +2471,19 @@
     }
     if (appState.seriesError) {
       main.innerHTML = errorStateHtml(appState.seriesError, "retry-series");
-      bindActivate(main.querySelector("#retry-series"), () => {
-        void appState.loadSeriesList();
-      });
       return;
     }
     const isSearching = appState.seriesSearchQuery.trim().length > 0;
     main.innerHTML = `
-    <div class="hub-scroll" data-focus-zone="hub">
-      ${hubSearchField("series-search", "Search series by title, cast, or genre\u2026", appState.seriesSearchQuery)}
+    <div class="hub-layout" data-focus-zone="hub">
+      <div class="hub-search-bar" data-focus-zone="hub-search">
+        ${hubSearchField("series-search", "Search series by title, cast, or genre\u2026", appState.seriesSearchQuery)}
+      </div>
+      <div class="hub-scroll">
       ${isSearching ? renderSeriesSearchResults() : renderSeriesHubBrowse()}
+      </div>
     </div>
   `;
-    const searchInput = main.querySelector("#series-search");
-    if (searchInput) {
-      bindDebouncedSearch(searchInput, "series", (query) => {
-        appState.setSeriesSearch(query);
-      });
-    }
-    if (isSearching) {
-      bindSeriesPosters(main, (id) => appState.filteredSeriesItems().find((i) => i.seriesId === id));
-    } else {
-      bindRecentlyWatched(main, "series");
-      bindSeeAll(main, "series");
-      bindSeriesPosters(main, (id) => findSeriesItem(id));
-    }
   }
   function renderMoviesSearchResults() {
     const items = appState.filteredVodItems().slice(0, MAX_GRID_ITEMS);
@@ -2043,7 +2491,7 @@
       return emptyStateHtml("No movies match your search.");
     }
     return `<div class="hub-search-grid">
-    ${items.map((item) => moviePoster(item)).join("")}
+    ${items.map((item) => moviePoster(item, `search:vod:${item.streamId}`)).join("")}
   </div>`;
   }
   function renderSeriesSearchResults() {
@@ -2052,7 +2500,7 @@
       return emptyStateHtml("No series match your search.");
     }
     return `<div class="hub-search-grid">
-    ${items.map((item) => seriesPoster(item)).join("")}
+    ${items.map((item) => seriesPoster(item, `search:series:${item.seriesId}`)).join("")}
   </div>`;
   }
   function renderMoviesHubBrowse() {
@@ -2061,7 +2509,7 @@
       (row) => hubRowHtml(
         row.title,
         row.id,
-        row.items.map((item) => moviePoster(item)).join(""),
+        hubRowPosterSlice(row.id, row.items).map((item) => moviePoster(item, `${row.id}:${item.streamId}`)).join(""),
         row.items.length
       )
     ).join("");
@@ -2080,7 +2528,7 @@
       (row) => hubRowHtml(
         row.title,
         row.id,
-        row.items.map((item) => seriesPoster(item)).join(""),
+        hubRowPosterSlice(row.id, row.items).map((item) => seriesPoster(item, `${row.id}:${item.seriesId}`)).join(""),
         row.items.length
       )
     ).join("");
@@ -2098,7 +2546,7 @@
         imageUrl: entry.imageUrl,
         placeholderIcon: entry.kind === "vod" ? "\u{1F3AC}" : "\u{1F4FA}",
         progress,
-        attrs: `data-resume-key="${escapeAttr(entry.contentKey)}"`
+        attrs: `data-focus-key="recent:${escapeAttr(entry.contentKey)}" data-resume-key="${escapeAttr(entry.contentKey)}"`
       });
     }).join("");
     return `
@@ -2139,20 +2587,22 @@
     </button>
   `;
   }
-  function moviePoster(item) {
+  function moviePoster(item, focusKey) {
+    const key = focusKey != null ? focusKey : `vod:${item.streamId}`;
     return posterCardHtml({
       title: item.name,
       imageUrl: item.streamIcon,
       placeholderIcon: "\u{1F3AC}",
-      attrs: `data-stream-id="${item.streamId}" data-kind="vod"`
+      attrs: `data-focus-key="${escapeAttr(key)}" data-stream-id="${item.streamId}" data-kind="vod"`
     });
   }
-  function seriesPoster(item) {
+  function seriesPoster(item, focusKey) {
+    const key = focusKey != null ? focusKey : `series:${item.seriesId}`;
     return posterCardHtml({
       title: item.name,
       imageUrl: item.cover,
       placeholderIcon: "\u{1F4FA}",
-      attrs: `data-series-id="${item.seriesId}"`
+      attrs: `data-focus-key="${escapeAttr(key)}" data-series-id="${item.seriesId}"`
     });
   }
   function findVodItem(streamId) {
@@ -2184,7 +2634,8 @@
       vodStreamId: null,
       seriesId: null,
       episodeId: null,
-      seriesTitle: null
+      seriesTitle: null,
+      subtitleLanguages: []
     };
   }
   function vodPlaybackRequest(item) {
@@ -2201,69 +2652,9 @@
       vodStreamId: item.streamId,
       seriesId: null,
       episodeId: null,
-      seriesTitle: null
+      seriesTitle: null,
+      subtitleLanguages: []
     };
-  }
-  function bindDebouncedSearch(input, key, onSearch) {
-    input.addEventListener("input", () => {
-      const existing = debounceTimers.get(key);
-      if (existing) clearTimeout(existing);
-      debounceTimers.set(
-        key,
-        setTimeout(() => {
-          debounceTimers.delete(key);
-          void onSearch(input.value);
-        }, SEARCH_DEBOUNCE_MS)
-      );
-    });
-  }
-  function bindGridPlayback(container, buildRequest) {
-    for (const el of container.querySelectorAll('[data-stream-id][data-kind="live"]')) {
-      bindActivate(el, () => {
-        const req = buildRequest(el);
-        if (req) appState.openPlayer(req);
-      });
-    }
-  }
-  function bindMoviePosters(container, resolveItem) {
-    for (const el of container.querySelectorAll('[data-stream-id][data-kind="vod"]')) {
-      bindActivate(el, () => {
-        var _a;
-        const id = parseInt((_a = el.dataset.streamId) != null ? _a : "0", 10);
-        const item = resolveItem(id);
-        if (!item) return;
-        const req = vodPlaybackRequest(item);
-        if (req) appState.openPlayer(req);
-      });
-    }
-  }
-  function bindSeriesPosters(container, resolveItem) {
-    for (const el of container.querySelectorAll("[data-series-id]")) {
-      bindActivate(el, () => {
-        var _a;
-        const id = parseInt((_a = el.dataset.seriesId) != null ? _a : "0", 10);
-        const series = resolveItem(id);
-        if (series) appState.openSeriesDetail(series);
-      });
-    }
-  }
-  function bindSeeAll(container, tab) {
-    for (const btn of container.querySelectorAll("[data-see-all]")) {
-      bindActivate(btn, () => {
-        const rowId = btn.dataset.seeAll;
-        appState.openHubBrowse(tab, rowId);
-      });
-    }
-  }
-  function bindRecentlyWatched(container, kind) {
-    const history = recentlyWatchedEntries(kind);
-    for (const el of container.querySelectorAll("[data-resume-key]")) {
-      bindActivate(el, () => {
-        const key = el.dataset.resumeKey;
-        const entry = history.find((h) => h.contentKey === key);
-        if (entry) appState.openPlayer(entryToPlaybackRequest(entry));
-      });
-    }
   }
   function logoutIconSvg() {
     return `<svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true"><path fill="currentColor" d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5-5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z"/></svg>`;
@@ -2284,98 +2675,1029 @@
     return `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H8V4h12v12z"/></svg>`;
   }
 
-  // src/screens/player.ts
-  var activeCleanup = null;
-  function renderPlayer(root2, request) {
+  // src/services/subtitle-parser.ts
+  function parseTimestamp(value) {
+    const cleaned = value.trim().replace(",", ".");
+    const parts = cleaned.split(":");
+    if (parts.length === 3) {
+      const [h, m, rest] = parts;
+      const [s, ms = "0"] = rest.split(".");
+      return parseInt(h, 10) * 3600 + parseInt(m, 10) * 60 + parseInt(s, 10) + parseInt(ms.padEnd(3, "0").slice(0, 3), 10) / 1e3;
+    }
+    if (parts.length === 2) {
+      const [m, rest] = parts;
+      const [s, ms = "0"] = rest.split(".");
+      return parseInt(m, 10) * 60 + parseInt(s, 10) + parseInt(ms.padEnd(3, "0").slice(0, 3), 10) / 1e3;
+    }
+    return 0;
+  }
+  function parseSubtitleContent(content, url) {
+    const trimmed = content.trim();
+    if (trimmed.startsWith("WEBVTT") || url.toLowerCase().includes(".vtt")) {
+      return parseVtt(trimmed);
+    }
+    return parseSrt(trimmed);
+  }
+  function parseSrt(content) {
+    const cues = [];
+    const normalized = content.replace(/\r/g, "").trim();
+    const blocks = normalized.split(/\n{2,}/);
+    for (const block of blocks) {
+      const lines = block.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
+      if (lines.length < 2) continue;
+      const timeLine = lines.find((l) => l.includes("-->"));
+      if (!timeLine) continue;
+      const [startStr, endStr] = timeLine.split("-->").map((s) => s.trim());
+      const textStart = lines.indexOf(timeLine) + 1;
+      const text = lines.slice(textStart).join("\n").replace(/<[^>]+>/g, "").replace(/\{\\.*?\}/g, "").trim();
+      if (!text) continue;
+      const start = parseTimestamp(startStr);
+      const end = parseTimestamp(endStr);
+      if (end <= start) continue;
+      cues.push({ start, end, text });
+    }
+    return cues;
+  }
+  function parseVtt(content) {
+    const cues = [];
+    const body = content.replace(/^WEBVTT[^\n]*\n/i, "");
+    const blocks = body.replace(/\r/g, "").split(/\n\n+/);
+    for (const block of blocks) {
+      const lines = block.split("\n");
+      const timeLine = lines.find((l) => l.includes("-->"));
+      if (!timeLine) continue;
+      const [startStr, endStr] = timeLine.split("-->").map((s) => s.trim().split(" ")[0]);
+      const textStart = lines.indexOf(timeLine) + 1;
+      const text = lines.slice(textStart).join("\n").replace(/<[^>]+>/g, "").trim();
+      if (!text) continue;
+      cues.push({
+        start: parseTimestamp(startStr),
+        end: parseTimestamp(endStr),
+        text
+      });
+    }
+    return cues;
+  }
+
+  // src/services/subtitle-loader.ts
+  var MAX_BYTES = 4 * 1024 * 1024;
+  function resolveUrl(base, relative) {
+    if (/^https?:\/\//i.test(relative)) return relative;
+    if (relative.startsWith("/")) {
+      return `${new URL(base).origin}${relative}`;
+    }
+    return new URL(relative, base).href;
+  }
+  function isM3u8(content, url) {
+    const trimmed = content.trim();
+    return trimmed.startsWith("#EXTM3U") || url.toLowerCase().includes(".m3u8") || trimmed.includes("#EXT-X-TARGETDURATION");
+  }
+  async function fetchText(url) {
+    try {
+      const response = await iptvFetch(url);
+      if (!response.ok) return null;
+      const buffer = await response.arrayBuffer();
+      if (buffer.byteLength > MAX_BYTES) return null;
+      return new TextDecoder("utf-8").decode(buffer).replace(/^\uFEFF/, "");
+    } catch {
+      return null;
+    }
+  }
+  function parseHlsWebVttPlaylist(text, playlistUrl) {
+    const lines = text.replace(/\r/g, "").split("\n");
+    const segments = [];
+    let pendingDuration = 0;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (line.startsWith("#EXTINF:")) {
+        const match = line.match(/#EXTINF:([0-9.]+)/);
+        pendingDuration = match ? parseFloat(match[1]) : 0;
+        continue;
+      }
+      if (!line || line.startsWith("#")) continue;
+      segments.push({ url: resolveUrl(playlistUrl, line), duration: pendingDuration });
+      pendingDuration = 0;
+    }
+    return segments;
+  }
+  async function loadHlsWebVttCues(playlistUrl) {
+    const playlistText = await fetchText(playlistUrl);
+    if (!playlistText) return [];
+    if (!isM3u8(playlistText, playlistUrl)) {
+      return parseSubtitleContent(playlistText, playlistUrl);
+    }
+    const segments = parseHlsWebVttPlaylist(playlistText, playlistUrl);
+    if (segments.length === 0) return [];
+    const cues = [];
+    let offset = 0;
+    for (const segment of segments) {
+      const segmentText = await fetchText(segment.url);
+      if (segmentText) {
+        const segmentCues = parseSubtitleContent(segmentText, segment.url);
+        for (const cue of segmentCues) {
+          cues.push({
+            start: cue.start + offset,
+            end: cue.end + offset,
+            text: cue.text
+          });
+        }
+      }
+      offset += segment.duration;
+    }
+    return cues;
+  }
+  async function loadSubtitleCues(url, baseUrl) {
+    const resolved = baseUrl ? resolveUrl(baseUrl, url) : url;
+    const text = await fetchText(resolved);
+    if (!text) return [];
+    if (isM3u8(text, resolved)) {
+      return loadHlsWebVttCues(resolved);
+    }
+    return parseSubtitleContent(text, resolved);
+  }
+  async function validateSubtitleUrl(url, baseUrl) {
+    const cues = await loadSubtitleCues(url, baseUrl);
+    return cues.length > 0 ? cues : [];
+  }
+
+  // src/services/subtitle-resolver.ts
+  function langVariants(lang) {
+    var _a;
+    const raw = lang.trim();
+    if (!raw) return [];
+    const lower = raw.toLowerCase();
+    const variants = /* @__PURE__ */ new Set([lower, raw]);
+    const map = {
+      english: ["en", "eng", "english"],
+      en: ["en", "eng", "english"],
+      swedish: ["sv", "swe", "swedish"],
+      sv: ["sv", "swe", "swedish"],
+      german: ["de", "deu", "ger", "german"],
+      de: ["de", "deu", "ger", "german"],
+      french: ["fr", "fre", "fra", "french"],
+      fr: ["fr", "fre", "fra", "french"],
+      spanish: ["es", "spa", "spanish"],
+      es: ["es", "spa", "spanish"],
+      norwegian: ["no", "nor", "nb", "norwegian"],
+      no: ["no", "nor", "nb", "norwegian"]
+    };
+    for (const v of (_a = map[lower]) != null ? _a : []) variants.add(v);
+    return [...variants];
+  }
+  function isUrlLike2(value) {
+    return /^https?:\/\//i.test(value) || value.startsWith("/");
+  }
+  function resolveUrl2(base, relative) {
+    if (/^https?:\/\//i.test(relative)) return relative;
+    if (relative.startsWith("/")) {
+      const origin = new URL(base).origin;
+      return `${origin}${relative}`;
+    }
+    return new URL(relative, base).href;
+  }
+  function buildSidecarCandidates(videoUrl, languageHints) {
+    const urls = /* @__PURE__ */ new Set();
+    const withoutQuery = videoUrl.split("?")[0];
+    const base = withoutQuery.replace(/\.[a-z0-9]+$/i, "");
+    const exts = ["srt", "vtt"];
+    for (const ext of exts) {
+      urls.add(`${base}.${ext}`);
+      urls.add(`${base}.en.${ext}`);
+      urls.add(`${base}.eng.${ext}`);
+    }
+    for (const hint of languageHints) {
+      if (isUrlLike2(hint)) {
+        urls.add(hint.startsWith("/") ? resolveUrl2(videoUrl, hint) : hint);
+        continue;
+      }
+      for (const variant of langVariants(hint)) {
+        for (const ext of exts) {
+          urls.add(`${base}.${variant}.${ext}`);
+          urls.add(`${base}_${variant}.${ext}`);
+          urls.add(`${base}-${variant}.${ext}`);
+        }
+      }
+    }
+    return [...urls];
+  }
+  function labelFromUrl(url, fallback) {
     var _a, _b;
-    activeCleanup == null ? void 0 : activeCleanup();
-    activeCleanup = null;
-    const urls = [request.url, ...request.fallbackUrls];
-    let urlIndex = 0;
-    const log = [
-      "=== Playback debug ===",
-      `Title: ${request.title}`,
-      `Kind: ${request.kind}`,
-      ...urls.map((u, i) => `  ${i + 1}. ${u}`),
-      ""
-    ];
-    root2.innerHTML = `
-    <div class="screen player-screen">
-      <video id="player-video" class="player-video" autoplay></video>
-      <div class="player-overlay">
-        <h2 class="player-title">${escapeHtml2(request.title)}</h2>
-        <p class="player-status" id="player-status">Loading\u2026</p>
-        <div class="player-actions">
-          <button type="button" class="btn focusable" id="player-back" tabindex="0">Back</button>
-          <button type="button" class="btn focusable" id="toggle-debug" tabindex="0">Debug log</button>
+    const filename = (_b = (_a = url.split("/").pop()) == null ? void 0 : _a.split("?")[0]) != null ? _b : url;
+    if (/\.(srt|vtt)$/i.test(filename)) {
+      const stem = filename.replace(/\.(srt|vtt)$/i, "");
+      if (/^\d+$/.test(stem)) return fallback;
+      return stem.replace(/[._-]/g, " ").trim() || fallback;
+    }
+    return fallback;
+  }
+  async function discoverHlsSubtitleTracks(masterUrl) {
+    try {
+      const response = await iptvFetch(masterUrl);
+      if (!response.ok) return [];
+      const text = await response.text();
+      const tracks = [];
+      for (const line of text.split("\n")) {
+        if (!line.includes("TYPE=SUBTITLES")) continue;
+        const uriMatch = line.match(/URI="([^"]+)"/);
+        if (!uriMatch) continue;
+        const nameMatch = line.match(/NAME="([^"]+)"/);
+        const langMatch = line.match(/LANGUAGE="([^"]+)"/);
+        const label = (nameMatch == null ? void 0 : nameMatch[1]) || (langMatch == null ? void 0 : langMatch[1]) || `Subtitle ${tracks.length + 1}`;
+        tracks.push({
+          id: `hls:${tracks.length}:${uriMatch[1]}`,
+          label,
+          url: resolveUrl2(masterUrl, uriMatch[1])
+        });
+      }
+      return tracks;
+    } catch {
+      return [];
+    }
+  }
+  async function resolveExternalSubtitleTracks(options) {
+    var _a;
+    const { videoUrl, languageHints, api, vodStreamId } = options;
+    const hints = [];
+    for (const entry of languageHints) {
+      hints.push(...parseSubtitleHints(entry));
+    }
+    const candidates = [];
+    const seenUrls = /* @__PURE__ */ new Set();
+    const addCandidate = (url, label, idPrefix) => {
+      const resolved = resolveUrl2(videoUrl, url);
+      if (seenUrls.has(resolved)) return;
+      seenUrls.add(resolved);
+      candidates.push({
+        id: `${idPrefix}:${candidates.length}`,
+        label: labelFromUrl(resolved, label),
+        url: resolved
+      });
+    };
+    if (api && vodStreamId != null && options.kind === "vod") {
+      try {
+        const info = await api.getVodInfo(vodStreamId);
+        for (const entry of info.subtitles) {
+          hints.push(...parseSubtitleHints(entry));
+        }
+      } catch {
+      }
+    }
+    for (const hint of hints) {
+      if (hint.url) {
+        addCandidate(hint.url, hint.label, "api");
+      }
+    }
+    if (videoUrl.toLowerCase().includes(".m3u8")) {
+      const hlsTracks = await discoverHlsSubtitleTracks(videoUrl);
+      for (const track of hlsTracks) {
+        addCandidate(track.url, track.label, "hls");
+      }
+    }
+    for (const url of buildSidecarCandidates(
+      videoUrl,
+      hints.map((h) => {
+        var _a2;
+        return (_a2 = h.url) != null ? _a2 : h.label;
+      })
+    )) {
+      addCandidate(url, (_a = url.split("/").pop()) != null ? _a : url, "sidecar");
+    }
+    const found = [];
+    for (const candidate of candidates) {
+      const cues = await validateSubtitleUrl(candidate.url, videoUrl);
+      if (cues.length > 0) {
+        found.push(candidate);
+      }
+    }
+    return found;
+  }
+
+  // src/ui/subtitle-overlay.ts
+  function mountSubtitleOverlay(screen) {
+    const el = document.createElement("div");
+    el.className = "player-subtitle-overlay hidden";
+    el.innerHTML = '<span class="player-subtitle-text"></span>';
+    screen.appendChild(el);
+    const textEl = el.querySelector(".player-subtitle-text");
+    let cues = [];
+    let boundVideo = null;
+    let onTimeUpdate = null;
+    const update = (video) => {
+      const t = video.currentTime;
+      const active = cues.find((c) => t >= c.start && t < c.end);
+      if (active) {
+        textEl.textContent = active.text;
+        el.classList.remove("hidden");
+      } else {
+        textEl.textContent = "";
+        el.classList.add("hidden");
+      }
+    };
+    return {
+      destroy() {
+        el.remove();
+      },
+      setCues(next) {
+        cues = next;
+        if (boundVideo) update(boundVideo);
+      },
+      bindVideo(video) {
+        boundVideo = video;
+        if (onTimeUpdate) {
+          video.removeEventListener("timeupdate", onTimeUpdate);
+        }
+        onTimeUpdate = () => update(video);
+        video.addEventListener("timeupdate", onTimeUpdate);
+        update(video);
+      },
+      syncNow(video) {
+        update(video);
+      },
+      clear() {
+        cues = [];
+        textEl.textContent = "";
+        el.classList.add("hidden");
+      }
+    };
+  }
+
+  // src/ui/player-controls.ts
+  var HIDE_AFTER_MS = 4e3;
+  var SEEK_STEP_SEC = 10;
+  function formatTime(seconds) {
+    if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
+    const total = Math.floor(seconds);
+    const h = Math.floor(total / 3600);
+    const m = Math.floor(total % 3600 / 60);
+    const s = total % 60;
+    if (h > 0) {
+      return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+    }
+    return `${m}:${String(s).padStart(2, "0")}`;
+  }
+  function escapeHtml2(s) {
+    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+  function isOkKey(event) {
+    return event.key === "Enter" || event.keyCode === 13 || event.keyCode === 28;
+  }
+  function arrowDirection(event) {
+    const code = event.keyCode;
+    if (event.key === "ArrowUp" || code === 38) return "up";
+    if (event.key === "ArrowDown" || code === 40) return "down";
+    if (event.key === "ArrowLeft" || code === 37) return "left";
+    if (event.key === "ArrowRight" || code === 39) return "right";
+    return null;
+  }
+  function isPlayPauseKey(event) {
+    return event.keyCode === 415 || event.keyCode === 19 || event.key === "MediaPlayPause";
+  }
+  function isRewindKey(event) {
+    return event.keyCode === 412 || event.key === "MediaRewind";
+  }
+  function isForwardKey(event) {
+    return event.keyCode === 417 || event.key === "MediaFastForward";
+  }
+  function isSubtitleRemoteKey(event) {
+    return event.keyCode === 460 || event.keyCode === 462 || event.key === "Subtitle";
+  }
+  function buildPlayerChromeHtml(title, isLive) {
+    const seekSection = isLive ? "" : `
+        <div class="player-seek-section" id="player-seek-section">
+          <div class="player-seek-times">
+            <span class="player-time" id="player-time-current">0:00</span>
+            <span class="player-time" id="player-time-duration">0:00</span>
+          </div>
+          <div class="player-seek-bar" id="player-seek-bar">
+            <div class="player-seek-track">
+              <div class="player-seek-fill" id="player-seek-fill"></div>
+              <div class="player-seek-thumb" id="player-seek-thumb"></div>
+            </div>
+          </div>
+        </div>`;
+    return `
+    <video id="player-video" class="player-video" autoplay playsinline preload="auto"></video>
+    <div class="player-hit-layer" id="player-hit" tabindex="0"></div>
+    <div class="player-chrome player-chrome--visible" id="player-chrome">
+      <div class="player-top-bar">
+        <button type="button" class="player-back-btn focusable" id="player-back" tabindex="0" aria-label="Back">
+          <svg viewBox="0 0 24 24" width="36" height="36" aria-hidden="true"><path fill="currentColor" d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg>
+        </button>
+      </div>
+      <div class="player-buffering hidden" id="player-buffering"><div class="spinner"></div></div>
+      <div class="player-track-panel hidden" id="player-track-panel">
+        <p class="player-track-heading">Subtitles</p>
+        <div class="player-track-list" id="player-track-list"></div>
+      </div>
+      <div class="player-bottom">
+        ${seekSection}
+        <p class="player-transport-title">${escapeHtml2(title)}</p>
+        <div class="player-transport-main">
+          <button type="button" class="player-play-btn focusable" id="player-play" tabindex="0" aria-label="Play">
+            <svg class="player-icon-play" viewBox="0 0 24 24" width="48" height="48"><path fill="currentColor" d="M8 5v14l11-7z"/></svg>
+            <svg class="player-icon-pause hidden" viewBox="0 0 24 24" width="48" height="48"><path fill="currentColor" d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+          </button>
+          <button type="button" class="player-subs-btn focusable player-transport-btn--subs" id="player-subs" tabindex="0" aria-label="Subtitles">
+            <svg viewBox="0 0 24 24" width="32" height="32"><path fill="currentColor" d="M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zM4 12h4v2H4v-2zm10 6H4v-2h10v2zm6 0h-4v-2h4v2zm0-4H10v-2h10v2z"/></svg>
+          </button>
+          ${isLive ? '<span class="player-live-badge">LIVE</span>' : ""}
         </div>
-        <pre class="player-debug hidden" id="player-debug"></pre>
       </div>
     </div>
   `;
-    const video = root2.querySelector("#player-video");
-    const statusEl = root2.querySelector("#player-status");
-    const debugEl = root2.querySelector("#player-debug");
-    const appendLog = (line) => {
-      log.push(line);
-      debugEl.textContent = log.join("\n");
+  }
+  function mountPlayerControls(screen, options) {
+    const { title, isLive, onBack, subtitleContext } = options;
+    screen.innerHTML = buildPlayerChromeHtml(title, isLive);
+    const subtitleOverlay = mountSubtitleOverlay(screen);
+    subtitleOverlay.bindVideo(screen.querySelector("#player-video"));
+    const video = screen.querySelector("#player-video");
+    const chrome = screen.querySelector("#player-chrome");
+    const hitLayer = screen.querySelector("#player-hit");
+    const backBtn = screen.querySelector("#player-back");
+    const bufferingEl = screen.querySelector("#player-buffering");
+    const trackPanel = screen.querySelector("#player-track-panel");
+    const trackList = screen.querySelector("#player-track-list");
+    const playBtn = screen.querySelector("#player-play");
+    const playIcon = playBtn.querySelector(".player-icon-play");
+    const pauseIcon = playBtn.querySelector(".player-icon-pause");
+    const subsBtn = screen.querySelector("#player-subs");
+    const seekBar = screen.querySelector("#player-seek-bar");
+    const seekFill = screen.querySelector("#player-seek-fill");
+    const seekThumb = screen.querySelector("#player-seek-thumb");
+    const timeCurrent = screen.querySelector("#player-time-current");
+    const timeDuration = screen.querySelector("#player-time-duration");
+    let visible = true;
+    let trackMenuOpen = false;
+    let hideTimer = null;
+    let seekDragging = false;
+    let selectedTrackKey = "off";
+    let focusTarget = "play";
+    let externalLoadToken = 0;
+    let externalTracks = [];
+    let externalTracksLoading = false;
+    let externalTracksError = null;
+    let currentVideoUrl = "";
+    const clearHideTimer = () => {
+      if (hideTimer) clearTimeout(hideTimer);
+      hideTimer = null;
     };
-    const setStatus = (text) => {
-      statusEl.textContent = text;
+    const setRemoteFocusEnabled = (enabled) => {
+      const candidates = screen.querySelectorAll(
+        "#player-back, #player-play, #player-subs, .player-track-option"
+      );
+      for (const el of candidates) {
+        if (el.classList.contains("hidden")) {
+          el.tabIndex = -1;
+          continue;
+        }
+        if (el.classList.contains("player-track-option") && !trackMenuOpen) {
+          el.tabIndex = -1;
+          continue;
+        }
+        el.tabIndex = enabled ? 0 : -1;
+      }
+      hitLayer.tabIndex = enabled ? -1 : 0;
+      if (enabled) {
+        const el = focusTarget === "back" ? backBtn : focusTarget === "subs" ? subsBtn : playBtn;
+        el.focus();
+      } else {
+        hitLayer.focus();
+      }
     };
-    const tryNextUrl = () => {
-      if (urlIndex >= urls.length) {
-        setStatus("All stream URLs failed.");
-        appendLog("Result: FAILED (exhausted candidates)");
+    const refreshRemoteFocus = () => {
+      setRemoteFocusEnabled(visible);
+    };
+    const setChromeVisible = (show) => {
+      visible = show;
+      chrome.classList.toggle("player-chrome--visible", show);
+      chrome.classList.toggle("player-chrome--hidden", !show);
+      setRemoteFocusEnabled(show);
+      if (!show) {
+        trackMenuOpen = false;
+        trackPanel.classList.add("hidden");
+        subsBtn.classList.remove("player-transport-btn--active");
+      }
+    };
+    const resetHideTimer = () => {
+      clearHideTimer();
+      if (!visible) return;
+      hideTimer = setTimeout(() => setChromeVisible(false), HIDE_AFTER_MS);
+    };
+    const showControls = (keepMenu = false) => {
+      setChromeVisible(true);
+      if (!keepMenu) {
+        trackMenuOpen = false;
+        trackPanel.classList.add("hidden");
+        subsBtn.classList.remove("player-transport-btn--active");
+      }
+      resetHideTimer();
+    };
+    const onUserInteraction = () => {
+      if (!visible) showControls(trackMenuOpen);
+      else resetHideTimer();
+    };
+    const updatePlayIcon = () => {
+      const playing = !video.paused && !video.ended;
+      playIcon.classList.toggle("hidden", playing);
+      pauseIcon.classList.toggle("hidden", !playing);
+      playBtn.setAttribute("aria-label", playing ? "Pause" : "Play");
+    };
+    const pauseAndShow = () => {
+      if (!video.paused && !video.ended) {
+        video.pause();
+        updatePlayIcon();
+      }
+      focusTarget = "play";
+      showControls();
+    };
+    const seekRelative = (deltaSec) => {
+      if (isLive || !Number.isFinite(video.duration)) return;
+      video.currentTime = Math.max(0, Math.min(video.duration, video.currentTime + deltaSec));
+      onUserInteraction();
+      updateSeekUi();
+    };
+    const seekToFraction = (fraction) => {
+      if (isLive || !Number.isFinite(video.duration) || video.duration <= 0) return;
+      const clamped = Math.max(0, Math.min(1, fraction));
+      video.currentTime = video.duration * clamped;
+      updateSeekUi();
+    };
+    const updateSeekUi = () => {
+      if (!timeCurrent || !timeDuration) return;
+      const dur = video.duration;
+      if (!Number.isFinite(dur) || dur <= 0) {
+        timeDuration.textContent = "0:00";
+        if (seekFill) seekFill.style.width = "0%";
+        if (seekThumb) seekThumb.style.left = "0%";
         return;
       }
-      const url = urls[urlIndex];
-      urlIndex += 1;
-      appendLog(`Trying URL ${urlIndex}/${urls.length}: ${url}`);
-      setStatus(`Loading stream ${urlIndex}/${urls.length}\u2026`);
-      video.pause();
-      video.removeAttribute("src");
-      while (video.firstChild) {
-        video.removeChild(video.firstChild);
+      const fraction = video.currentTime / dur;
+      timeCurrent.textContent = formatTime(video.currentTime);
+      timeDuration.textContent = formatTime(dur);
+      if (!seekDragging && seekFill && seekThumb) {
+        const pct = `${fraction * 100}%`;
+        seekFill.style.width = pct;
+        seekThumb.style.left = pct;
       }
-      const source = document.createElement("source");
-      source.src = url;
-      if (url.includes(".m3u8")) {
-        source.type = "application/vnd.apple.mpegurl";
-      } else if (url.includes(".ts")) {
-        source.type = "video/mp2t";
-      } else {
-        source.type = "video/mp4";
+    };
+    const applySubtitleTrack = (trackKey) => {
+      selectedTrackKey = trackKey;
+      for (let i = 0; i < video.textTracks.length; i++) {
+        video.textTracks[i].mode = "hidden";
       }
-      if (request.resumePositionMs > 5e3 && request.kind !== "live") {
-        const options = {
-          option: {
-            transmission: {
-              playTime: { start: request.resumePositionMs }
+      subtitleOverlay.clear();
+      if (trackKey === "off") {
+        renderTrackList();
+        return;
+      }
+      if (!trackKey.startsWith("ext:")) {
+        renderTrackList();
+        return;
+      }
+      const id = trackKey.slice(4);
+      const track = externalTracks.find((t) => t.id === id);
+      if (!track) {
+        renderTrackList();
+        return;
+      }
+      void (async () => {
+        try {
+          const cues = await loadSubtitleCues(track.url, currentVideoUrl || video.src);
+          if (selectedTrackKey !== trackKey) return;
+          if (cues.length === 0) {
+            console.warn(`[subtitles] No cues parsed from ${track.url}`);
+            selectedTrackKey = "off";
+            renderTrackList();
+            return;
+          }
+          subtitleOverlay.setCues(cues);
+          subtitleOverlay.bindVideo(video);
+          subtitleOverlay.syncNow(video);
+          console.log(`[subtitles] Loaded ${cues.length} cues from ${track.label}`);
+          renderTrackList();
+        } catch (err) {
+          console.warn(`[subtitles] Failed to load ${track.url}:`, err);
+          selectedTrackKey = "off";
+          renderTrackList();
+        }
+      })();
+      renderTrackList();
+    };
+    const loadExternalTracks = (videoUrl) => {
+      if (!subtitleContext || !videoUrl) return;
+      currentVideoUrl = videoUrl;
+      const token = ++externalLoadToken;
+      externalTracksLoading = true;
+      externalTracksError = null;
+      externalTracks = [];
+      if (selectedTrackKey.startsWith("ext:")) {
+        selectedTrackKey = "off";
+        subtitleOverlay.clear();
+      }
+      renderTrackList();
+      void (async () => {
+        try {
+          const tracks = await resolveExternalSubtitleTracks({
+            videoUrl,
+            kind: subtitleContext.kind,
+            languageHints: subtitleContext.languageHints,
+            api: subtitleContext.api,
+            vodStreamId: subtitleContext.vodStreamId
+          });
+          if (token !== externalLoadToken || videoUrl !== currentVideoUrl) return;
+          externalTracks = tracks;
+          if (tracks.length === 0) {
+            externalTracksError = "No external subtitle files found for this stream.";
+          }
+        } catch {
+          if (token === externalLoadToken) {
+            externalTracksError = "Could not search for subtitles.";
+          }
+        } finally {
+          if (token === externalLoadToken) {
+            externalTracksLoading = false;
+            renderTrackList();
+          }
+        }
+      })();
+    };
+    const renderTrackList = () => {
+      const items = [
+        { label: "Off", key: "off" }
+      ];
+      for (const track of externalTracks) {
+        items.push({ label: track.label, key: `ext:${track.id}` });
+      }
+      if (externalTracksLoading) {
+        items.push({ label: "Searching for subtitles\u2026", key: "loading", disabled: true });
+      } else if (externalTracks.length === 0) {
+        items.push({
+          label: externalTracksError != null ? externalTracksError : "No subtitles found",
+          key: "none",
+          disabled: true
+        });
+      }
+      subsBtn.classList.remove("hidden");
+      trackList.innerHTML = items.map(
+        (item) => `<button type="button" class="player-track-option focusable${selectedTrackKey === item.key ? " player-track-option--active" : ""}${item.disabled ? " player-track-option--disabled" : ""}" data-track-key="${item.key}" tabindex="${item.disabled ? "-1" : "0"}"${item.disabled ? " disabled" : ""}>${escapeHtml2(item.label)}</button>`
+      ).join("");
+      for (const btn of trackList.querySelectorAll(".player-track-option:not([disabled])")) {
+        btn.addEventListener("click", () => {
+          var _a;
+          const key = (_a = btn.dataset.trackKey) != null ? _a : "off";
+          if (key === "loading" || key === "none") return;
+          applySubtitleTrack(key);
+          onUserInteraction();
+        });
+      }
+      if (trackMenuOpen) refreshRemoteFocus();
+    };
+    const toggleTrackMenu = () => {
+      var _a;
+      trackMenuOpen = !trackMenuOpen;
+      trackPanel.classList.toggle("hidden", !trackMenuOpen);
+      subsBtn.classList.toggle("player-transport-btn--active", trackMenuOpen);
+      if (trackMenuOpen) {
+        showControls(true);
+        refreshRemoteFocus();
+        (_a = trackList.querySelector(".player-track-option")) == null ? void 0 : _a.focus();
+      }
+      resetHideTimer();
+    };
+    const togglePlayPause = () => {
+      onUserInteraction();
+      if (video.paused || video.ended) void video.play();
+      else video.pause();
+      updatePlayIcon();
+    };
+    const focusPrimaryTarget = (target) => {
+      focusTarget = target;
+      const el = target === "back" ? backBtn : target === "subs" ? subsBtn : playBtn;
+      el.focus();
+      backBtn.classList.toggle("player-focus-active", target === "back");
+      playBtn.classList.toggle("player-focus-active", target === "play");
+      subsBtn.classList.toggle("player-focus-active", target === "subs");
+    };
+    const onPlayerKeyDown = (event) => {
+      var _a;
+      if (!document.querySelector(".player-screen")) return;
+      const current = document.activeElement;
+      if (isPlayPauseKey(event)) {
+        event.preventDefault();
+        event.stopPropagation();
+        if (!visible) pauseAndShow();
+        else togglePlayPause();
+        return;
+      }
+      if (isRewindKey(event)) {
+        event.preventDefault();
+        event.stopPropagation();
+        showControls();
+        seekRelative(-SEEK_STEP_SEC);
+        return;
+      }
+      if (isForwardKey(event)) {
+        event.preventDefault();
+        event.stopPropagation();
+        showControls();
+        seekRelative(SEEK_STEP_SEC);
+        return;
+      }
+      if (isSubtitleRemoteKey(event)) {
+        event.preventDefault();
+        event.stopPropagation();
+        renderTrackList();
+        showControls(true);
+        if (!trackMenuOpen) toggleTrackMenu();
+        focusPrimaryTarget("subs");
+        return;
+      }
+      if (isOkKey(event)) {
+        if ((current == null ? void 0 : current.classList.contains("player-track-option")) && !current.disabled) {
+          event.preventDefault();
+          event.stopPropagation();
+          const key = (_a = current.dataset.trackKey) != null ? _a : "off";
+          if (key !== "loading" && key !== "none") {
+            applySubtitleTrack(key);
+            trackMenuOpen = false;
+            trackPanel.classList.add("hidden");
+            subsBtn.classList.remove("player-transport-btn--active");
+            focusPrimaryTarget("subs");
+          }
+          onUserInteraction();
+          return;
+        }
+        if (current === subsBtn) {
+          event.preventDefault();
+          event.stopPropagation();
+          toggleTrackMenu();
+          return;
+        }
+        if (current === backBtn) {
+          event.preventDefault();
+          event.stopPropagation();
+          onBack();
+          return;
+        }
+        if (current === playBtn && visible) {
+          event.preventDefault();
+          event.stopPropagation();
+          togglePlayPause();
+          return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        pauseAndShow();
+        return;
+      }
+      const dir = arrowDirection(event);
+      if (dir) {
+        event.preventDefault();
+        event.stopPropagation();
+        if (!visible) {
+          showControls();
+          if (dir === "left") seekRelative(-SEEK_STEP_SEC);
+          if (dir === "right") seekRelative(SEEK_STEP_SEC);
+          focusPrimaryTarget("play");
+          return;
+        }
+        onUserInteraction();
+        if (trackMenuOpen && (current == null ? void 0 : current.classList.contains("player-track-option"))) {
+          if (dir === "up" || dir === "down") {
+            const options2 = Array.from(trackList.querySelectorAll(".player-track-option"));
+            const idx = options2.indexOf(current);
+            const next = dir === "up" ? options2[idx - 1] : options2[idx + 1];
+            if (next) next.focus();
+            else if (dir === "down") {
+              trackMenuOpen = false;
+              trackPanel.classList.add("hidden");
+              subsBtn.classList.remove("player-transport-btn--active");
+              focusPrimaryTarget("play");
             }
           }
-        };
-        source.type = `${source.type};mediaOption=${encodeURIComponent(JSON.stringify(options))}`;
+          return;
+        }
+        if (dir === "left") {
+          seekRelative(-SEEK_STEP_SEC);
+          return;
+        }
+        if (dir === "right") {
+          seekRelative(SEEK_STEP_SEC);
+          return;
+        }
+        if (dir === "up") {
+          if (current === subsBtn) focusPrimaryTarget("play");
+          else if (current === playBtn) focusPrimaryTarget("back");
+          else focusPrimaryTarget("back");
+          return;
+        }
+        if (dir === "down") {
+          if (current === backBtn) focusPrimaryTarget("play");
+          else if (current === playBtn) focusPrimaryTarget("subs");
+          else focusPrimaryTarget("subs");
+        }
       }
-      video.appendChild(source);
-      video.load();
-      void video.play().catch((err) => {
-        appendLog(`play() rejected: ${String(err)}`);
+    };
+    document.addEventListener("keydown", onPlayerKeyDown, true);
+    backBtn.addEventListener("click", onBack);
+    playBtn.addEventListener("click", togglePlayPause);
+    subsBtn.addEventListener("click", toggleTrackMenu);
+    hitLayer.addEventListener("click", () => {
+      if (visible) togglePlayPause();
+      else pauseAndShow();
+    });
+    hitLayer.addEventListener("mousemove", onUserInteraction);
+    if (seekBar && seekFill && seekThumb) {
+      const seekFromClientX = (clientX) => {
+        const rect = seekBar.getBoundingClientRect();
+        if (rect.width <= 0) return;
+        seekToFraction((clientX - rect.left) / rect.width);
+      };
+      seekBar.addEventListener("mousedown", (event) => {
+        seekDragging = true;
+        onUserInteraction();
+        seekFromClientX(event.clientX);
       });
+      document.addEventListener("mousemove", (event) => {
+        if (!seekDragging) return;
+        seekFromClientX(event.clientX);
+      });
+      document.addEventListener("mouseup", () => {
+        if (!seekDragging) return;
+        seekDragging = false;
+        onUserInteraction();
+      });
+    }
+    const onTimeUpdate = () => updateSeekUi();
+    const onPlayState = () => updatePlayIcon();
+    const onLoadedMetadata = () => updateSeekUi();
+    const onCanPlay = () => {
+      if (video.src) loadExternalTracks(video.src);
     };
-    const onError = () => {
-      appendLog(`media error on URL ${urlIndex}`);
-      tryNextUrl();
+    video.addEventListener("timeupdate", onTimeUpdate);
+    video.addEventListener("play", onPlayState);
+    video.addEventListener("pause", onPlayState);
+    video.addEventListener("canplay", onCanPlay);
+    video.addEventListener("loadedmetadata", onLoadedMetadata);
+    showControls();
+    focusPrimaryTarget("play");
+    return {
+      destroy() {
+        clearHideTimer();
+        document.removeEventListener("keydown", onPlayerKeyDown, true);
+        video.removeEventListener("timeupdate", onTimeUpdate);
+        video.removeEventListener("play", onPlayState);
+        video.removeEventListener("pause", onPlayState);
+        video.removeEventListener("canplay", onCanPlay);
+        video.removeEventListener("loadedmetadata", onLoadedMetadata);
+        subtitleOverlay.destroy();
+      },
+      getVideoElement() {
+        return video;
+      },
+      setBuffering(buffering) {
+        bufferingEl.classList.toggle("hidden", !buffering);
+      },
+      showControls() {
+        showControls();
+      },
+      setVideoUrl(url) {
+        loadExternalTracks(url);
+      }
     };
-    const onPlaying = () => {
-      setStatus("Playing");
-      appendLog("Playback started");
-    };
-    const onWaiting = () => setStatus("Buffering\u2026");
+  }
+
+  // src/services/stream-probe.ts
+  function isReachableStatus(code) {
+    return code === 200 || code === 206 || code === 301 || code === 302 || code === 307 || code === 308;
+  }
+  async function probeStreamUrl(url) {
+    const log = [`--- Probe: ${url} ---`];
+    for (const method of ["HEAD", "GET"]) {
+      try {
+        const init = method === "GET" ? { method: "GET", headers: { Range: "bytes=0-4095" } } : { method: "HEAD" };
+        const started = Date.now();
+        const response = await iptvFetch(url, init);
+        const ms = Date.now() - started;
+        log.push(`${method} ${response.status} (${ms}ms)`);
+        const ct = response.headers.get("content-type");
+        if (ct) log.push(`Content-Type: ${ct}`);
+        if (isReachableStatus(response.status)) {
+          return { url, reachable: true, statusCode: response.status, log: log.join("\n") };
+        }
+      } catch (e) {
+        log.push(`${method} error: ${String(e)}`);
+      }
+    }
+    return { url, reachable: false, statusCode: null, log: log.join("\n") };
+  }
+  async function probeBestStreamIndex(urls, appendLog) {
+    appendLog("Probing stream URLs\u2026");
+    for (let i = 0; i < urls.length; i++) {
+      const result = await probeStreamUrl(urls[i]);
+      appendLog(`[${i + 1}/${urls.length}] ${result.reachable ? "OK" : "FAIL"}`);
+      appendLog(result.log);
+      if (result.reachable) {
+        if (i > 0) {
+          appendLog(`Using candidate ${i + 1} (first reachable probe).`);
+        }
+        return i;
+      }
+    }
+    appendLog("No probe succeeded; trying candidate 1 in player.");
+    return 0;
+  }
+
+  // src/screens/player.ts
+  var activeCleanup = null;
+  var STALL_TIMEOUT_MS = 2e4;
+  function renderPlayer(root2, request) {
+    var _a;
+    activeCleanup == null ? void 0 : activeCleanup();
+    activeCleanup = null;
+    const urls = [request.url, ...request.fallbackUrls];
+    const isLive = request.kind === "live";
+    let urlIndex = 0;
+    let failedCurrent = false;
+    let stallTimer = null;
     let progressTimer = null;
-    const saveProgress = () => {
+    let controls = null;
+    root2.innerHTML = '<div class="screen player-screen"></div>';
+    const screen = root2.querySelector(".player-screen");
+    controls = mountPlayerControls(screen, {
+      title: request.title,
+      isLive,
+      onBack: () => {
+        saveProgress();
+        appState.goHome(isLive ? "live" : request.kind === "series" ? "series" : "movies");
+      },
+      subtitleContext: {
+        kind: request.kind,
+        languageHints: (_a = request.subtitleLanguages) != null ? _a : [],
+        api: appState.api,
+        vodStreamId: request.vodStreamId
+      }
+    });
+    const video = controls.getVideoElement();
+    const log = (line) => {
+      console.log(`[player] ${line}`);
+    };
+    const clearStallTimer = () => {
+      if (stallTimer) clearTimeout(stallTimer);
+      stallTimer = null;
+    };
+    const armStallTimer = () => {
+      clearStallTimer();
+      if (urlIndex >= urls.length) return;
+      stallTimer = setTimeout(() => {
+        failCurrentUrl("Playback stalled (timeout).");
+      }, STALL_TIMEOUT_MS);
+    };
+    const applyResumeIfNeeded = () => {
+      if (isLive || request.resumePositionMs <= 5e3) return;
+      const targetSec = request.resumePositionMs / 1e3;
+      if (video.duration && targetSec >= video.duration - 2) return;
+      try {
+        video.currentTime = targetSec;
+        log(`Resume seek to ${Math.floor(targetSec)}s`);
+      } catch {
+      }
+    };
+    const loadUrlAtIndex = (index) => {
+      if (index >= urls.length) {
+        controls == null ? void 0 : controls.setBuffering(false);
+        log("All stream URLs failed.");
+        clearStallTimer();
+        return;
+      }
+      urlIndex = index;
+      failedCurrent = false;
+      const url = urls[index];
+      log(`Opening candidate ${index + 1}/${urls.length}: ${url}`);
+      controls == null ? void 0 : controls.setBuffering(true);
+      video.pause();
+      video.removeAttribute("src");
+      video.src = url;
+      video.load();
+      controls == null ? void 0 : controls.setVideoUrl(url);
+      void video.play().catch((err) => {
+        log(`play() rejected: ${String(err)}`);
+      });
+      armStallTimer();
+    };
+    const failCurrentUrl = (reason) => {
       var _a2;
-      if (!appState.accountKey || request.kind === "live") return;
+      if (failedCurrent || urlIndex >= urls.length) return;
+      failedCurrent = true;
+      clearStallTimer();
+      const code = (_a2 = video.error) == null ? void 0 : _a2.code;
+      log(`Stream failed: ${reason}${code != null ? ` (code ${code})` : ""}`);
+      loadUrlAtIndex(urlIndex + 1);
+    };
+    const saveProgress = () => {
+      var _a2, _b;
+      if (!appState.accountKey || isLive) return;
       const accountKey = appState.accountKey;
       const contentKey = (_a2 = request.contentKey) != null ? _a2 : request.vodStreamId != null ? `vod:${request.vodStreamId}` : request.title;
       const entry = {
@@ -2383,7 +3705,7 @@
         contentKey,
         kind: request.kind,
         title: request.title,
-        url: request.url,
+        url: (_b = urls[urlIndex]) != null ? _b : request.url,
         fallbackUrls: request.fallbackUrls,
         imageUrl: request.imageUrl,
         positionMs: Math.floor(video.currentTime * 1e3),
@@ -2397,40 +3719,70 @@
       };
       upsertHistory(entry);
     };
+    const onError = () => failCurrentUrl("Media error");
+    const onPlaying = () => {
+      clearStallTimer();
+      controls == null ? void 0 : controls.setBuffering(false);
+      log("Playback started");
+    };
+    const onWaiting = () => {
+      controls == null ? void 0 : controls.setBuffering(true);
+      armStallTimer();
+    };
+    const onLoadedMetadata = () => applyResumeIfNeeded();
+    const onEnded = () => {
+      if (isLive) failCurrentUrl("Live stream ended unexpectedly");
+    };
     video.addEventListener("error", onError);
     video.addEventListener("playing", onPlaying);
     video.addEventListener("waiting", onWaiting);
+    video.addEventListener("loadedmetadata", onLoadedMetadata);
+    video.addEventListener("ended", onEnded);
     progressTimer = setInterval(() => {
-      if (!video.paused && request.kind !== "live" && video.currentTime > 5) {
+      if (!video.paused && !isLive && video.currentTime > 5) {
         saveProgress();
       }
     }, 15e3);
-    (_a = root2.querySelector("#player-back")) == null ? void 0 : _a.addEventListener("click", () => {
-      saveProgress();
-      appState.goHome("live");
-    });
-    (_b = root2.querySelector("#toggle-debug")) == null ? void 0 : _b.addEventListener("click", () => {
-      debugEl.classList.toggle("hidden");
-    });
-    debugEl.textContent = log.join("\n");
-    tryNextUrl();
-    focusFirst(root2);
+    void (async () => {
+      if (isLive && urls.length > 0) {
+        urlIndex = await probeBestStreamIndex(urls, log);
+      }
+      loadUrlAtIndex(urlIndex);
+    })();
     activeCleanup = () => {
+      clearStallTimer();
       if (progressTimer) clearInterval(progressTimer);
       video.removeEventListener("error", onError);
       video.removeEventListener("playing", onPlaying);
       video.removeEventListener("waiting", onWaiting);
+      video.removeEventListener("loadedmetadata", onLoadedMetadata);
+      video.removeEventListener("ended", onEnded);
+      controls == null ? void 0 : controls.destroy();
       video.pause();
-      while (video.firstChild) video.removeChild(video.firstChild);
+      video.removeAttribute("src");
     };
-  }
-  function escapeHtml2(s) {
-    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   }
 
   // src/main.ts
   var root;
   var renderScheduled = false;
+  var lastPlayerRequestKey = null;
+  function playbackRequestKey(request) {
+    var _a, _b, _c;
+    return [
+      request.kind,
+      (_a = request.contentKey) != null ? _a : "",
+      request.url,
+      (_b = request.vodStreamId) != null ? _b : "",
+      (_c = request.episodeId) != null ? _c : ""
+    ].join("|");
+  }
+  function isSamePlayerSession(request) {
+    if (lastPlayerRequestKey === null) return false;
+    const key = playbackRequestKey(request);
+    if (key !== lastPlayerRequestKey) return false;
+    return root.querySelector(".player-screen") != null;
+  }
   function showFatalError(error) {
     var _a;
     const message = error instanceof Error ? (_a = error.stack) != null ? _a : error.message : String(error);
@@ -2445,20 +3797,29 @@
     try {
       const screen = appState.screen;
       if (screen.name === "login") {
+        lastPlayerRequestKey = null;
         renderLogin(root);
       } else if (screen.name === "home") {
+        lastPlayerRequestKey = null;
         renderHome(root);
       } else if (screen.name === "hub-browse") {
+        lastPlayerRequestKey = null;
         renderHubBrowse(root);
       } else if (screen.name === "series-detail") {
+        lastPlayerRequestKey = null;
         renderSeriesDetail(root);
       } else if (screen.name === "player") {
+        if (isSamePlayerSession(screen.request)) {
+          return;
+        }
+        lastPlayerRequestKey = playbackRequestKey(screen.request);
         dismissTvKeyboard();
         renderPlayer(root, screen.request);
       }
     } catch (error) {
       showFatalError(error);
     }
+    invalidateFocusCache();
   }
   function scheduleRender() {
     if (renderScheduled) return;
@@ -2475,7 +3836,8 @@
       return;
     }
     root = el;
-    initFocusRoot(document.body);
+    initFocusRoot(root);
+    bindAppScreenDelegation(root);
     appState.subscribe(scheduleRender);
     document.addEventListener("keydown", (event) => {
       const isBack = event.keyCode === 461 || event.key === "Backspace" || event.key === "Escape" || event.key === "GoBack";

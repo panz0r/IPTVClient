@@ -6,6 +6,7 @@ import {
 } from './account-status';
 import { formatJsonBody, iptvFetch, DEFAULT_HEADERS } from './http';
 import { resolveLiveFormats } from './live-stream-format';
+import { parseSubtitleHints, subtitleHintsToLanguages } from '../utils/subtitle-hints';
 import { normalizeServerUrl } from './server-url-normalizer';
 
 export interface XtreamCredentials {
@@ -60,11 +61,13 @@ export interface Episode {
   episodeNum: string | null;
   containerExtension: string | null;
   directSource: string | null;
+  subtitles: string[];
 }
 
 export interface VodInfo {
   genre: string | null;
   plot: string | null;
+  subtitles: string[];
 }
 
 export interface SeriesInfo {
@@ -243,6 +246,7 @@ export class XtreamApi {
     return {
       genre: strOrNull(infoRaw.genre),
       plot: strOrNull(infoRaw.plot),
+      subtitles: subtitleHintsToLanguages(parseSubtitleHints(infoRaw.subtitles)),
     };
   }
 
@@ -397,6 +401,7 @@ function parseEpisode(row: unknown): Episode {
     episodeNum: strOrNull(r.episode_num),
     containerExtension: strOrNull(r.container_extension),
     directSource: strOrNull(r.direct_source),
+    subtitles: subtitleHintsToLanguages(parseSubtitleHints(r.subtitles)),
   };
 }
 
@@ -524,4 +529,11 @@ function intOrZero(value: unknown): number {
   if (typeof value === 'number') return value;
   const n = parseInt(String(value ?? '0'), 10);
   return Number.isNaN(n) ? 0 : n;
+}
+
+function readStringList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((v) => (v != null ? String(v).trim() : ''))
+    .filter((v) => v.length > 0);
 }

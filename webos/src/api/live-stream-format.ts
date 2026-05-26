@@ -1,5 +1,6 @@
-const DEFAULT_FORMATS = ['ts', 'm3u8'];
-const PREFERRED_ORDER = ['ts', 'm3u8', 'mkv', 'mp4', 'rtmp'];
+/** webOS HTML5 video plays HLS natively; raw MPEG-TS progressive URLs usually fail. */
+const DEFAULT_FORMATS = ['m3u8', 'ts'];
+const PREFERRED_ORDER = ['m3u8', 'ts', 'mp4', 'mkv', 'rtmp'];
 
 export function resolveLiveFormats(
   allowedOutputFormats: string[] | null,

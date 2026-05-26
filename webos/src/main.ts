@@ -1,12 +1,31 @@
 import { appState } from './state/app-state';
 import { renderLogin } from './screens/login';
-import { renderHome, renderHubBrowse, renderSeriesDetail } from './screens/home';
+import { renderHome, renderHubBrowse, renderSeriesDetail, bindAppScreenDelegation } from './screens/home';
 import { renderPlayer } from './screens/player';
-import { initFocusRoot } from './ui/focus';
+import { initFocusRoot, invalidateFocusCache } from './ui/focus';
 import { dismissTvKeyboard } from './utils/keyboard';
+import type { PlaybackRequest } from './storage/watch-history';
 
 let root: HTMLElement;
 let renderScheduled = false;
+let lastPlayerRequestKey: string | null = null;
+
+function playbackRequestKey(request: PlaybackRequest): string {
+  return [
+    request.kind,
+    request.contentKey ?? '',
+    request.url,
+    request.vodStreamId ?? '',
+    request.episodeId ?? '',
+  ].join('|');
+}
+
+function isSamePlayerSession(request: PlaybackRequest): boolean {
+  if (lastPlayerRequestKey === null) return false;
+  const key = playbackRequestKey(request);
+  if (key !== lastPlayerRequestKey) return false;
+  return root.querySelector('.player-screen') != null;
+}
 
 function showFatalError(error: unknown): void {
   const message = error instanceof Error ? error.stack ?? error.message : String(error);
@@ -23,20 +42,29 @@ function render(): void {
   try {
     const screen = appState.screen;
     if (screen.name === 'login') {
+      lastPlayerRequestKey = null;
       renderLogin(root);
     } else if (screen.name === 'home') {
+      lastPlayerRequestKey = null;
       renderHome(root);
     } else if (screen.name === 'hub-browse') {
+      lastPlayerRequestKey = null;
       renderHubBrowse(root);
     } else if (screen.name === 'series-detail') {
+      lastPlayerRequestKey = null;
       renderSeriesDetail(root);
     } else if (screen.name === 'player') {
+      if (isSamePlayerSession(screen.request)) {
+        return;
+      }
+      lastPlayerRequestKey = playbackRequestKey(screen.request);
       dismissTvKeyboard();
       renderPlayer(root, screen.request);
     }
   } catch (error) {
     showFatalError(error);
   }
+  invalidateFocusCache();
 }
 
 function scheduleRender(): void {
@@ -56,7 +84,8 @@ function bootstrap(): void {
     return;
   }
   root = el;
-  initFocusRoot(document.body);
+  initFocusRoot(root);
+  bindAppScreenDelegation(root);
 
   appState.subscribe(scheduleRender);
 

@@ -16,6 +16,7 @@ import {
 import { accountKeyFor } from '../storage/watch-history';
 import { filterByTitle } from '../utils/content-search';
 import { groupByGenre } from '../utils/genre-grouper';
+import { HUB_ROW_INITIAL_VISIBLE, HUB_ROW_LOAD_STEP } from '../utils/hub-row-nav';
 import { dismissTvKeyboard } from '../utils/keyboard';
 import { indexMissingVodGenres } from '../services/vod-genre-indexer';
 import { loadVodGenreCache } from '../storage/vod-genre-cache';
@@ -70,7 +71,11 @@ export class AppState {
   seriesDetailLoading = false;
   seriesDetailError: string | null = null;
 
+  /** Visible poster count per hub genre row (key = row id). */
+  hubRowVisibleCount: Record<string, number> = {};
+
   private listeners = new Set<Listener>();
+  private genreNotifyTimer: ReturnType<typeof setTimeout> | null = null;
 
   subscribe(listener: Listener): () => void {
     this.listeners.add(listener);
@@ -80,6 +85,32 @@ export class AppState {
   notify(): void {
     for (const l of this.listeners) {
       l();
+    }
+  }
+
+  private shouldRefreshHubUi(): boolean {
+    const name = this.screen.name;
+    return name === 'home' || name === 'hub-browse';
+  }
+
+  private scheduleGenreHubNotify(): void {
+    if (!this.shouldRefreshHubUi()) return;
+    if (this.genreNotifyTimer) return;
+    this.genreNotifyTimer = setTimeout(() => {
+      this.genreNotifyTimer = null;
+      if (this.shouldRefreshHubUi()) {
+        this.notify();
+      }
+    }, 1500);
+  }
+
+  private flushGenreHubNotify(): void {
+    if (this.genreNotifyTimer) {
+      clearTimeout(this.genreNotifyTimer);
+      this.genreNotifyTimer = null;
+    }
+    if (this.shouldRefreshHubUi()) {
+      this.notify();
     }
   }
 
@@ -126,6 +157,10 @@ export class AppState {
   logout(): void {
     dismissTvKeyboard();
     this.vodGenreIndexGeneration += 1;
+    if (this.genreNotifyTimer) {
+      clearTimeout(this.genreNotifyTimer);
+      this.genreNotifyTimer = null;
+    }
     clearCredentials();
     this.api = null;
     this.accountKey = null;
@@ -220,6 +255,7 @@ export class AppState {
     this.vodError = null;
     this.vodHubRows = [];
     this.vodAllMovies = [];
+    this.hubRowVisibleCount = {};
     this.notify();
     try {
       this.vodAllMovies = await this.api.getVodStreams();
@@ -233,7 +269,11 @@ export class AppState {
       this.notify();
 
       if (this.accountKey && this.api) {
-        void this.indexVodGenresInBackground(generation);
+        setTimeout(() => {
+          if (generation === this.vodGenreIndexGeneration) {
+            void this.indexVodGenresInBackground(generation);
+          }
+        }, 3000);
       }
     } catch (e) {
       this.vodError = String(e);
@@ -246,6 +286,8 @@ export class AppState {
     this.vodHubRows = groupByGenre({
       items: this.vodAllMovies,
       genreFor: (m) => this.genreForMovie(m),
+      maxRows: 20,
+      minItemsPerRow: 3,
     });
   }
 
@@ -259,7 +301,9 @@ export class AppState {
     if (missingCount === 0) return;
 
     this.vodLoadingGenres = true;
-    this.notify();
+    if (this.shouldRefreshHubUi()) {
+      this.notify();
+    }
 
     const api = this.api;
     const accountKey = this.accountKey;
@@ -275,14 +319,14 @@ export class AppState {
         if (generation !== this.vodGenreIndexGeneration) return;
         this.vodGenreByStreamId = genres;
         this.rebuildVodHubRows();
-        this.notify();
+        this.scheduleGenreHubNotify();
       },
     });
 
     if (generation !== this.vodGenreIndexGeneration) return;
     this.vodLoadingGenres = false;
     this.rebuildVodHubRows();
-    this.notify();
+    this.flushGenreHubNotify();
   }
 
   setVodSearch(query: string): void {
@@ -310,12 +354,15 @@ export class AppState {
     this.seriesError = null;
     this.seriesHubRows = [];
     this.seriesAllItems = [];
+    this.hubRowVisibleCount = {};
     this.notify();
     try {
       this.seriesAllItems = await this.api.getSeries();
       this.seriesHubRows = groupByGenre({
         items: this.seriesAllItems,
         genreFor: (s) => s.genre,
+        maxRows: 20,
+        minItemsPerRow: 3,
       });
     } catch (e) {
       this.seriesError = String(e);
@@ -344,6 +391,32 @@ export class AppState {
 
   seriesHubRow(rowId: string): HubContentRow<SeriesItem> | null {
     return this.seriesHubRows.find((r) => r.id === rowId) ?? null;
+  }
+
+  getHubRowVisibleCount(rowId: string): number {
+    return this.hubRowVisibleCount[rowId] ?? HUB_ROW_INITIAL_VISIBLE;
+  }
+
+  /** Load more posters in a hub row; returns focus key for the first newly revealed title. */
+  expandHubRow(rowId: string, tab: 'movies' | 'series'): string | null {
+    const row =
+      tab === 'movies' ? this.vodHubRow(rowId) : this.seriesHubRow(rowId);
+    if (!row) return null;
+
+    const prevCount = this.getHubRowVisibleCount(rowId);
+    if (prevCount >= row.items.length) return null;
+
+    const nextCount = Math.min(prevCount + HUB_ROW_LOAD_STEP, row.items.length);
+    this.hubRowVisibleCount[rowId] = nextCount;
+
+    const nextItem = row.items[prevCount];
+    const focusKey =
+      tab === 'movies'
+        ? `${rowId}:${(nextItem as VodItem).streamId}`
+        : `${rowId}:${(nextItem as SeriesItem).seriesId}`;
+
+    this.notify();
+    return focusKey;
   }
 
   openHubBrowse(tab: 'movies' | 'series', rowId: string): void {
@@ -413,6 +486,7 @@ export class AppState {
     this.seriesHubRows = [];
     this.seriesAllItems = [];
     this.seriesDetail = null;
+    this.hubRowVisibleCount = {};
   }
 }
 
